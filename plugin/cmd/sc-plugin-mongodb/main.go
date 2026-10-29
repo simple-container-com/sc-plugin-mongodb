@@ -167,15 +167,29 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	}
 
 	input := resourceInputFromComputeProcess(req, cfg, parent)
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+
+	// The database user is created through an explicit Atlas provider built from
+	// the resource's own keys, named exactly as SC core named it when this compute
+	// processor was in-tree (initProvider: "<stack>--<type>--<res>[--<dep>]--<env>--provider").
+	// Without it the DatabaseUser lands on the DEFAULT mongodbatlas provider, which
+	// has no credentials: the deploy fails at create with an Atlas 401, and a stack
+	// migrating from the in-tree processor would see its provider replaced.
+	provider, err := p.computeProvider(pctx, stack, req, cfg, parent)
+	if err != nil {
+		p.progress.Error("compute-process", err.Error())
+		return nil, err
+	}
 
 	// ClusterComputeProcessor returns an api.ResourceOutput and mutates
 	// the collector. Our sidecar wrapper is the collector — the SC-core
 	// sidecar then applies our env_vars + tpl_extensions back into the
 	// live core-side collector.
 	collector := newCapturingCollector()
-	_, err = mongoInternal.ClusterComputeProcessor(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, collector, pApi.ProvisionParams{
+	_, err = mongoInternal.ClusterComputeProcessor(pctx, stack, input, collector, pApi.ProvisionParams{
 		Log:         logger.New(),
 		ParentStack: parent,
+		Provider:    provider,
 	})
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
@@ -294,6 +308,34 @@ func resourceInputFromComputeProcess(req *scpluginv1.ComputeProcessRequest, cfg 
 			Environment: env,
 		},
 	}
+}
+
+// computeProvider builds the Atlas provider the compute processor's resources use.
+func (p *mongoPlugin) computeProvider(pctx *sdk.Context, stack api.Stack, req *scpluginv1.ComputeProcessRequest, cfg *mongoApi.AtlasConfig, parent *pApi.ParentInfo) (sdk.ProviderResource, error) {
+	resName := req.GetResourceName()
+	if parent != nil && parent.DependsOnResource != nil && parent.DependsOnResource.Name != "" {
+		resName = fmt.Sprintf("%s--%s", resName, parent.DependsOnResource.Name)
+	}
+	env := req.GetHeader().GetEnvironment()
+	if parent != nil && parent.ParentEnv != "" {
+		env = parent.ParentEnv
+	}
+	out, err := mongoInternal.Provider(pctx, stack, api.ResourceInput{
+		Descriptor: &api.ResourceDescriptor{
+			Type:   mongoApi.ProviderType,
+			Name:   fmt.Sprintf("%s--%s--%s--%s--provider", stack.Name, req.GetResourceType(), resName, env),
+			Config: api.Config{Config: cfg},
+		},
+		StackParams: &api.StackParams{StackName: stack.Name, Environment: env},
+	}, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		return nil, errors.Wrap(err, "init mongodb-atlas provider for compute-process")
+	}
+	prov, ok := out.Ref.(sdk.ProviderResource)
+	if !ok {
+		return nil, errors.Errorf("mongodb Provider returned %T, not sdk.ProviderResource", out.Ref)
+	}
+	return prov, nil
 }
 
 // waitForRef blocks until a Pulumi Output in a resource ref resolves —
