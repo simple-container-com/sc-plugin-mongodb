@@ -166,7 +166,7 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 		return nil, errors.Wrap(err, "decode AtlasConfig from ComputeProcess inputs")
 	}
 
-	input := resourceInputFromComputeProcess(req, cfg)
+	input := resourceInputFromComputeProcess(req, cfg, parent)
 
 	// ClusterComputeProcessor returns an api.ResourceOutput and mutates
 	// the collector. Our sidecar wrapper is the collector — the SC-core
@@ -274,7 +274,15 @@ func resourceInputFromProvision(req *scpluginv1.ProvisionRequest, cfg *mongoApi.
 	}
 }
 
-func resourceInputFromComputeProcess(req *scpluginv1.ComputeProcessRequest, cfg *mongoApi.AtlasConfig) api.ResourceInput {
+// resourceInputFromComputeProcess mirrors the in-tree processResourceDependency: the
+// resource lives in the PARENT's env (params.CopyForParentEnv(resEnv)), not the consuming
+// stack's env from the request header — e.g. a staging-ru client using the parent's
+// staging cluster must look up "<parent>--mongodb--staging-id", not "...--staging-ru-id".
+func resourceInputFromComputeProcess(req *scpluginv1.ComputeProcessRequest, cfg *mongoApi.AtlasConfig, parent *pApi.ParentInfo) api.ResourceInput {
+	env := req.GetHeader().GetEnvironment()
+	if parent != nil && parent.ParentEnv != "" {
+		env = parent.ParentEnv
+	}
 	return api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   req.GetResourceType(),
@@ -283,7 +291,7 @@ func resourceInputFromComputeProcess(req *scpluginv1.ComputeProcessRequest, cfg 
 		},
 		StackParams: &api.StackParams{
 			StackName:   req.GetHeader().GetStackName(),
-			Environment: req.GetHeader().GetEnvironment(),
+			Environment: env,
 		},
 	}
 }
