@@ -34,6 +34,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -155,11 +156,9 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	// ClusterComputeProcessor consumes params.ParentStack. v2 proto
 	// packs it as ParentInfoJson — unmarshal back into the Go struct the
 	// in-tree code expects.
-	parent := &pApi.ParentInfo{}
-	if raw := req.GetParentInfoJson(); len(raw) > 0 {
-		if err := yaml.Unmarshal(raw, parent); err != nil {
-			return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
-		}
+	parent, err := decodeParentInfo(req.GetParentInfoJson())
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := &mongoApi.AtlasConfig{}
@@ -343,4 +342,20 @@ func main() {
 			Output: os.Stderr,
 		}),
 	})
+}
+
+// decodeParentInfo reads ComputeProcessRequest.parent_info_json. Core writes it with
+// json.Marshal on an untagged struct, so the keys are the Go field names ("StackName",
+// "FullReference", …). It must be decoded as JSON: yaml.v3 matches untagged fields by
+// their lowercased names and leaves every field empty, which broke every `uses:` of a
+// mongodb-atlas resource (an empty parent StackReference).
+func decodeParentInfo(raw []byte) (*pApi.ParentInfo, error) {
+	parent := &pApi.ParentInfo{}
+	if len(raw) == 0 {
+		return parent, nil
+	}
+	if err := json.Unmarshal(raw, parent); err != nil {
+		return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
+	}
+	return parent, nil
 }
