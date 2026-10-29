@@ -195,6 +195,15 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
 	}
+	// Every MONGO_* variable is added inside an ApplyT on the database user
+	// (AddOutput). Answer before those have resolved and the response carries no
+	// env at all — and the deferred pctx.Close() then cuts the user's in-flight
+	// RegisterResource. Waiting here is what in-tree SC did by blocking the
+	// consumer's provisioning on collector.Outputs().
+	if err := collector.AwaitOutputs(ctx); err != nil {
+		p.progress.Error("compute-process", err.Error())
+		return nil, err
+	}
 
 	resp := collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
