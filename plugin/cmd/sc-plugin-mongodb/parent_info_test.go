@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+
+	mongoApi "github.com/simple-container-com/sc-plugin-mongodb/api"
 )
 
 // Core sends ParentInfo as json.Marshal of the untagged struct; decoding must round-trip.
@@ -33,5 +36,22 @@ func TestDecodeParentInfoEmpty(t *testing.T) {
 	got, err := decodeParentInfo(nil)
 	if err != nil || got == nil || got.StackName != "" {
 		t.Fatalf("empty input: got %+v, err %v", got, err)
+	}
+}
+
+// A staging-ru client using the parent's staging cluster resolves names in the parent env.
+func TestResourceInputUsesParentEnv(t *testing.T) {
+	req := &scpluginv1.ComputeProcessRequest{
+		Header:       &scpluginv1.RequestHeader{StackName: "two-peaks", Environment: "staging-ru"},
+		ResourceType: "mongodb-atlas",
+		ResourceName: "mongodb",
+	}
+	in := resourceInputFromComputeProcess(req, &mongoApi.AtlasConfig{}, &pApi.ParentInfo{ParentEnv: "staging"})
+	if in.StackParams.Environment != "staging" {
+		t.Fatalf("env = %q, want staging", in.StackParams.Environment)
+	}
+	in = resourceInputFromComputeProcess(req, &mongoApi.AtlasConfig{}, &pApi.ParentInfo{})
+	if in.StackParams.Environment != "staging-ru" {
+		t.Fatalf("fallback env = %q, want staging-ru", in.StackParams.Environment)
 	}
 }
