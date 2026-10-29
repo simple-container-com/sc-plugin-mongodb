@@ -1,0 +1,18 @@
+# Compiled binaries
+/sc-plugin-mongodb
+/plugin/sc-plugin-mongodb
+/dist/
+/bin/
+
+# Go test cache
+/plugin/vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
