@@ -583,44 +583,51 @@ func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scp
 	raw := pctx.GetCurrentExportMap()
 	out := make(map[string]*scpluginv1.InputValue, len(raw))
 	for k, v := range raw {
-		plain, err := awaitInputToPlain(ctx, v)
+		plain, secret, err := awaitInputToPlain(ctx, v)
 		if err != nil {
 			return out, errors.Wrapf(err, "await export %q", k)
 		}
 		if iv := anyToInputValue(plain); iv != nil {
+			iv.Secret = secret
 			out[k] = iv
 		}
 	}
 	return out, nil
 }
 
-// awaitInputToPlain resolves a Pulumi Input (which may be a bare value, a
-// pointer, an sdk.Output / sdk.StringOutput / IDOutput, …) to its concrete
-// Go value by awaiting any Output machinery and dereferencing any pointers.
-func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, error) {
+// awaitInputToPlain returns (concrete value, secret flag, error). The
+// Secret flag MUST be preserved: SC core wraps the re-export with
+// sdk.ToSecret when this bool is true, so a secret-marked output
+// doesn't land plaintext in the parent stack root. mongodb's exports
+// today are not secret-flagged (Mongo URIs are credential-free by
+// design in Cluster()), but the same wire shape ships for every plugin
+// and losing the flag would be a plaintext leak for anything that is.
+// Live-caught 2026-10-31 against the aws harvest; see Addendum V of
+// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md.
+func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, bool, error) {
 	if v == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	// Easy cases first — Pulumi's primitive Input wrappers resolve inline.
 	switch tv := v.(type) {
 	case sdk.String:
-		return string(tv), nil
+		return string(tv), false, nil
 	case sdk.Bool:
-		return bool(tv), nil
+		return bool(tv), false, nil
 	case sdk.Int:
-		return int(tv), nil
+		return int(tv), false, nil
 	case sdk.Float64:
-		return float64(tv), nil
+		return float64(tv), false, nil
 	}
 	// Pulumi's Output types all implement sdk.Output; await their value.
 	if out, ok := v.(sdk.Output); ok {
 		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
 		if aerr != nil {
-			return nil, aerr
+			return nil, false, aerr
 		}
-		return unwrapPlain(resolved.Value), nil
+		return unwrapPlain(resolved.Value), resolved.Secret, nil
 	}
-	return nil, nil
+	return nil, false, nil
 }
 
 func unwrapPlain(v any) any {
