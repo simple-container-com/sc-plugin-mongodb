@@ -95,11 +95,18 @@ func (p *mongoPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1
 }
 
 func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx here. See the aws plugin's identical note at
+	// sc-plugin-aws/plugin/cmd/sc-plugin-aws/main.go:222 and Addendum
+	// P/Q/R of 04-no-destroy-invariant.md: closing the context before
+	// Pulumi's background RegisterResource goroutines have talked to
+	// the monitor drops every in-flight registration silently, and the
+	// engine then plans a destroy of every pre-existing state entry.
+	// This is the exact bug that cascade-deleted the fleet's shared
+	// Atlas project on 2026-10-31 (parent provision 41195331666).
 	p.progress.Info("provider", fmt.Sprintf("initialising mongodb-atlas provider for %q", req.GetProviderResourceName()))
 
 	cfg := &mongoApi.AtlasConfig{}
@@ -119,11 +126,13 @@ func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequ
 }
 
 func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — see Provider() above. The 2026-10-31 cascade
+	// delete of project 697a574e90d5387e4a889f5f on parent provision
+	// 41195331666 was this exact bug firing from this exact function.
 	p.progress.Info("provision", fmt.Sprintf("provisioning mongodb cluster %q", req.GetResourceName()))
 
 	cfg := &mongoApi.AtlasConfig{}
@@ -179,11 +188,14 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 }
 
 func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — same reason as Provider/Provision above.
+	// ComputeProcess also registers a DatabaseUser + a RandomPassword
+	// via createDatabaseUser inside appendUsesResourceContext's ApplyT,
+	// which racecloses the same way the Provision registrations did.
 	p.progress.Info("compute-process", fmt.Sprintf("resource=%q type=%q", req.GetResourceName(), req.GetResourceType()))
 
 	// ClusterComputeProcessor consumes params.ParentStack. v2 proto

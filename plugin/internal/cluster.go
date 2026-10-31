@@ -14,7 +14,6 @@ import (
 	"github.com/pulumi/pulumi-random/sdk/v4/go/random"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	"github.com/simple-container-com/api/pkg/util"
@@ -104,17 +103,24 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 	})
 
 	params.Log.Info(ctx.Context(), "configure MongoDB Atlas cluster %q for stack %q in %q", clusterName, input.StackParams.StackName, input.StackParams.Environment)
+	// terminationProtectionEnabled is the Atlas API-side belt. sdk.Protect(true)
+	// above is the Pulumi-side braces. The former refuses the terminate API
+	// call regardless of what the IaC tool wants to do; the latter makes the
+	// IaC tool refuse to even try. Both wired to the same `deletionProtection`
+	// config field for operator ergonomics. After the 2026-10-31 cascade
+	// delete that destroyed project 697a574e90d5387e4a889f5f, this is required.
 	cluster, err := mongodbatlas.NewCluster(ctx, fmt.Sprintf("%s-cluster", clusterName), &mongodbatlas.ClusterArgs{
-		Name:                     sdk.StringPtr(clusterName),
-		ProviderRegionName:       sdk.StringPtr(atlasCfg.Region),
-		ProviderInstanceSizeName: sdk.String(atlasCfg.InstanceSize),
-		ClusterType:              sdk.StringPtr("REPLICASET"),
-		ProjectId:                projectId,
-		BackingProviderName:      sdk.StringPtrFromPtr(lo.If(isSharedInstanceSize, &atlasCfg.CloudProvider).Else(nil)),
-		ProviderName:             sdk.String(lo.If(isSharedInstanceSize, "TENANT").Else(atlasCfg.CloudProvider)),
-		DiskSizeGb:               sdk.Float64PtrFromPtr(atlasCfg.DiskSizeGB),
-		CloudBackup:              sdk.BoolPtr(lo.If(atlasCfg.Backup != nil, true).Else(false)),
-		NumShards:                sdk.IntPtrFromPtr(atlasCfg.NumShards),
+		Name:                         sdk.StringPtr(clusterName),
+		ProviderRegionName:           sdk.StringPtr(atlasCfg.Region),
+		ProviderInstanceSizeName:     sdk.String(atlasCfg.InstanceSize),
+		ClusterType:                  sdk.StringPtr("REPLICASET"),
+		ProjectId:                    projectId,
+		BackingProviderName:          sdk.StringPtrFromPtr(lo.If(isSharedInstanceSize, &atlasCfg.CloudProvider).Else(nil)),
+		ProviderName:                 sdk.String(lo.If(isSharedInstanceSize, "TENANT").Else(atlasCfg.CloudProvider)),
+		DiskSizeGb:                   sdk.Float64PtrFromPtr(atlasCfg.DiskSizeGB),
+		CloudBackup:                  sdk.BoolPtr(lo.If(atlasCfg.Backup != nil, true).Else(false)),
+		NumShards:                    sdk.IntPtrFromPtr(atlasCfg.NumShards),
+		TerminationProtectionEnabled: sdk.BoolPtr(atlasCfg.DeletionProtection),
 	}, opts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create mongodb cluster for stack %q", stack.Name)
