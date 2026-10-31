@@ -191,13 +191,13 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 		}
 	}
 
-	// Public access requires an explicit opt-in; nil/empty config denies access.
-	if networkConfig.AllowsAllIPs() {
+	// Preserve the legacy access-list resource unless hardening is explicitly enabled.
+	if atlasCfg.AllowsPublicAccess() {
 		params.Log.Info(ctx.Context(), "configure MongoDB Atlas ip access list for cluster %q in stack %q in %q",
 			clusterName, input.StackParams.StackName, input.StackParams.Environment)
 		_, err := mongodbatlas.NewProjectIpAccessList(ctx, fmt.Sprintf("%s-ip-access-list", clusterName), &mongodbatlas.ProjectIpAccessListArgs{
 			CidrBlock: sdk.StringPtr("0.0.0.0/0"),
-			Comment:   sdk.StringPtr("Public access explicitly enabled with networkConfig.allowAllIps"),
+			Comment:   sdk.StringPtr("Allow all access to the cluster (TODO: restrict to our cluster only)"),
 			ProjectId: projectId,
 		}, opts...)
 		if err != nil {

@@ -3,7 +3,10 @@
 
 package mongodb
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestServiceDatabaseRolesRequireOplogOptIn(t *testing.T) {
 	for _, allow := range []bool{false, true} {
@@ -32,12 +35,12 @@ func boolInt(b bool) int {
 
 func TestOplogPrincipalDoesNotPrivilegeLegacyOrOtherEnvironments(t *testing.T) {
 	legacy := dbUserInput{projectId: "project", username: "meeting"}
-	plain := serviceUserInputs(legacy, "meeting", "staging", false)
+	plain := serviceUserInputs(legacy, "meeting", "staging", false, true)
 	if len(plain) != 1 || plain[0].username != legacy.username {
 		t.Fatal("default user identity changed")
 	}
-	staging := serviceUserInputs(legacy, "meeting", "staging", true)
-	production := serviceUserInputs(legacy, "meeting", "production", true)
+	staging := serviceUserInputs(legacy, "meeting", "staging", true, true)
+	production := serviceUserInputs(legacy, "meeting", "production", true, true)
 	if len(staging) != 2 || staging[0].username != legacy.username || len(staging[0].roles) != 2 {
 		t.Fatalf("legacy user was privileged or removed: %+v", staging)
 	}
@@ -53,5 +56,24 @@ func TestOplogPrincipalDoesNotPrivilegeLegacyOrOtherEnvironments(t *testing.T) {
 				t.Fatalf("unexpected database role: %+v", role)
 			}
 		}
+	}
+}
+
+func TestDefaultServiceUserMatchesOriginMain(t *testing.T) {
+	users := serviceUserInputs(dbUserInput{username: "app"}, "app", "prod", false, false)
+	if len(users) != 1 || users[0].username != "app" || len(users[0].roles) != 3 || users[0].roles[2] != (dbRole{dbName: "local", role: "read"}) {
+		t.Fatalf("default changed legacy user/roles: %+v", users)
+	}
+}
+
+func TestLegacyTemplateMatchesOriginMain(t *testing.T) {
+	want := map[string]string{
+		"uri":    "mongodb+srv://app:password@example.net/app",
+		"dbName": "app", "password": "password", "user": "app",
+		"oplogUri": "mongodb+srv://app:password@example.net/local",
+	}
+	got := serviceDatabaseTemplate("mongodb+srv://example.net", "app", "password", "app", true)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy template changed: %+v", got)
 	}
 }

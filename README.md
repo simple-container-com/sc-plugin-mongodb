@@ -68,69 +68,49 @@ plugin clones from). See the authoring guide at
 
 MIT. See [LICENSE](LICENSE).
 
-## Atlas least privilege (S-04)
+## Optional Atlas hardening (S-04)
 
-A consuming stack's generated user keeps `dbAdmin` and `readWrite` on its own
-database. It no longer receives `read` on `local` or an `oplogUri` template
-extension by default. Applications that require the oplog must be explicitly
-listed in the Atlas resource config in `server.yaml` (works for both `uses` and `dependencies`):
+Upgrading with unchanged config preserves the original behavior. Missing
+`networkConfig` still creates the same `<cluster>-ip-access-list` resource with
+`0.0.0.0/0`, including its original properties. Generated service users keep their
+names, passwords, `dbAdmin`/`readWrite` on their database, `read` on `local`, and
+the `oplogUri` template key. No flags are required for existing stacks.
+
+The following explicit opt-ins are **recommended for new stacks**. Set them in
+the `mongodb-atlas` resource config in `server.yaml`:
 
 ```yaml
-# Inside the mongodb-atlas resource config:
+disableDefaultPublicAccess: true
+leastPrivilegeUsers: true
+networkConfig:
+  allowCidrs: [203.0.113.10/32] # actual application/NAT egress IPs
 oplogReaders:
   - meeting-app/staging
-networkConfig:
-  allowCidrs: [203.0.113.10/32] # replace with actual application/NAT egress IPs
 ```
 
-Each reader is exactly `stack-name/consuming-environment`, not the parent resource
-environment; wildcards and bare stack names grant nothing. Other stacks and
-other environments do not gain oplog access. This is resource-side authorization
-because the compute-process plugin receives the resource config, not the
-consuming stack's client descriptor.
+| Flag | Opt-in behavior |
+| --- | --- |
+| `disableDefaultPublicAccess` | Stops creating the implicit open access-list entry when `networkConfig` is absent. A top-level scalar flag works with older scalar-only transports. Explicit `networkConfig.allowAllIps: true` still grants public access. |
+| `leastPrivilegeUsers` | Removes `read@local` and `oplogUri` from ordinary users. Only consumers explicitly listed in `oplogReaders` receive oplog credentials and the template key. |
 
-**This grants visibility into writes from every database in the cluster,
-including other environments.** Use only with an intentional trust boundary;
-prefer a dedicated cluster for applications that need the oplog.
-Existing oplog-dependent stacks must be listed before upgrading. The existing
-user retains its name/credentials and loses `read@local` in place. An explicit
-reader additionally gets a separate environment-specific `sc-oplog-<hash>`
-principal; its MONGO_USER/PASSWORD/URI and template extensions switch together
-to that principal. The original service-user export is retained for database
-cleanup. Environments sharing a legacy username never share the privileged
-principal. Revoking access requires removing the reader and redeploying that
-consuming stack so its privileged user is removed and credentials switch back.
+Enabling either flag on an existing stack is an intentional migration. Arrange
+application egress access before removing a managed public entry. If that entry
+is protected by `deletionProtection`, unprotect only its access-list URN before
+removal; keep the project and cluster protected. Access lists are project-wide;
+independently managed entries remain unchanged. Explicit CIDR configuration and
+PrivateLink's existing unsupported status are unchanged.
 
-Public access now defaults to deny: omitted `networkConfig`, `{}`, and
-`allowAllIps: false` create no open access-list entry. Configure the resource in
-`server.yaml` with your applications' outbound CIDRs before upgrading:
+With `leastPrivilegeUsers: true`, each `oplogReaders` entry must match exactly
+`stack-name/consuming-environment` for both `uses` and `dependencies`. Wildcards
+and bare names grant nothing. An allowed reader gets a separate environment
+specific `sc-oplog-<hash>` principal, and MONGO_USER/PASSWORD/URI and template
+values switch together. The legacy user and its cleanup export remain, with
+reduced roles. Oplog access exposes writes from every database in the cluster;
+use a dedicated cluster when that trust boundary is required. Remove the reader
+and redeploy that consuming stack to revoke its separate principal. With the
+flag omitted, `oplogReaders` does not alter legacy usernames or permissions.
 
-```yaml
-# Inside the mongodb-atlas resource config:
-networkConfig:
-  allowCidrs: [203.0.113.10/32] # replace with actual application/NAT egress IPs
-```
-
-`networkConfig: {allowAllIps: true}` explicitly preserves the old open behavior
-when migration cannot be completed first; it allows the entire IPv4 internet
-and is discouraged. Existing managed implicit `0.0.0.0/0` entries will be removed
-on the next provision unless this opt-in is set. If `deletionProtection` was
-previously enabled, the old public access-list resource is protected too:
-unprotect **only that access-list URN in Pulumi state** before applying the
-removal. Keep the project and cluster protected. Alternatively, temporarily set
-`allowAllIps: true` while arranging this state-only migration; leaving it set
-retains public access. Access lists are project-wide; entries managed outside this stack (including adopted project entries) remain
-unchanged, so this does not remove independently managed public access.
-
-The plugin already supports CIDRs, so deny by default is feasible and no new
-network configuration field is needed. AWS VPC peering/PrivateLink provisioning
-is not added here: PrivateLink remains explicitly unsupported pending the
-cross-plugin PeerInvoke integration described above. CIDR allowlisting is the
-supported network boundary in this release.
-
-Structured config crosses older scalar-only plugin transports through a JSON
-fallback emitted by this plugin's `/api` config module and read by the plugin
-binary. Upgrade both the config module used by SC and the plugin binary together;
-rebuild SC with this `/api` revision when its embedded module predates this change.
-This prevents CIDR and reader lists from being silently dropped. No core protocol
-change is required.
+Structured config crosses older scalar-only plugin transports through the JSON
+fallback emitted by this plugin's `/api` module. Upgrade both the config module
+used by SC and the plugin binary to use CIDR and reader lists reliably. The
+legacy missing-network default requires no nested-map transport or JSON payload.

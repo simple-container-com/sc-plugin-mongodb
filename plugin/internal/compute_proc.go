@@ -69,7 +69,7 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		return nil, errors.Errorf("mongo uri is empty for %q (%q)", stack.Name, mongoUriExport)
 	}
 
-	readOplog := mongoConfig.AllowsOplog(stack.Name, params.ParentStack.StackEnv)
+	readOplog := !mongoConfig.LeastPrivilegeUsers || mongoConfig.AllowsOplog(stack.Name, params.ParentStack.StackEnv)
 	appendContextParams := appendParams{
 		stack:           stack,
 		collector:       collector,
@@ -81,6 +81,7 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		provisionParams: params,
 		suffix:          suffix,
 		readOplog:       readOplog,
+		leastPrivilege:  mongoConfig.LeastPrivilegeUsers,
 	}
 	if params.ParentStack.UsesResource {
 		if err := appendUsesResourceContext(ctx, appendContextParams); err != nil {
@@ -113,6 +114,7 @@ type appendParams struct {
 	dependency      api.StackConfigDependencyResource
 	suffix          string
 	readOplog       bool
+	leastPrivilege  bool
 }
 
 func appendUsesResourceContext(ctx *sdk.Context, params appendParams) error {
@@ -126,12 +128,12 @@ func appendUsesResourceContext(ctx *sdk.Context, params appendParams) error {
 		dbUri:       params.mongoUri,
 		username:    legacyUserName,
 		suffix:      params.suffix,
-	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.provisionParams)
+	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.leastPrivilege, params.provisionParams)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create service user for database %q", dbName)
 	}
 	if dbUser != nil {
-		if params.readOplog {
+		if params.leastPrivilege && params.readOplog {
 			ctx.Export(fmt.Sprintf("%s-%s-oplog-user", params.clusterName, userName), dbUser)
 		}
 		ctx.Export(fmt.Sprintf("%s%s-service-user", params.clusterName, params.suffix), originalUser)
@@ -182,12 +184,12 @@ func appendDependsOnResourceContext(ctx *sdk.Context, params appendParams) error
 		dbUri:       params.mongoUri,
 		username:    legacyUserName,
 		suffix:      params.suffix,
-	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.provisionParams)
+	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.leastPrivilege, params.provisionParams)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create service user for database %q", dbName)
 	}
 	if dbUser != nil {
-		if params.readOplog {
+		if params.leastPrivilege && params.readOplog {
 			ctx.Export(fmt.Sprintf("%s-%s-oplog-user", params.clusterName, userName), dbUser)
 		}
 		ctx.Export(fmt.Sprintf("%s--to--%s--%s%s", params.clusterName, ownerStackName, params.dependency.Resource, params.suffix), originalUser)

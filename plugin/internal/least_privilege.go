@@ -29,13 +29,13 @@ func serviceDatabaseTemplate(uri, user, password, database string, readOplog boo
 	return values
 }
 
-// Keep the legacy user (and password/resource identities) without oplog access.
+// Preserve the legacy user, roles and password/resource identities by default.
 // Explicit readers use a separate principal so a stack name reused in another
 // environment cannot inherit local read through the legacy shared username.
-func serviceUserInputs(legacy dbUserInput, database, environment string, readOplog bool) []dbUserInput {
-	legacy.roles = serviceDatabaseRoles(database, false)
+func serviceUserInputs(legacy dbUserInput, database, environment string, readOplog, leastPrivilege bool) []dbUserInput {
+	legacy.roles = serviceDatabaseRoles(database, !leastPrivilege)
 	users := []dbUserInput{legacy}
-	if readOplog {
+	if leastPrivilege && readOplog {
 		privileged := legacy
 		identity := sha256.Sum256([]byte(legacy.projectId + "\x00" + legacy.username + "\x00" + environment))
 		privileged.username = fmt.Sprintf("sc-oplog-%x", identity)
@@ -45,8 +45,8 @@ func serviceUserInputs(legacy dbUserInput, database, environment string, readOpl
 	return users
 }
 
-func createServiceDatabaseUsers(ctx *sdk.Context, legacy dbUserInput, database, environment string, readOplog bool, params pApi.ProvisionParams) (runtime, original sdk.Output, username string, err error) {
-	for i, user := range serviceUserInputs(legacy, database, environment, readOplog) {
+func createServiceDatabaseUsers(ctx *sdk.Context, legacy dbUserInput, database, environment string, readOplog, leastPrivilege bool, params pApi.ProvisionParams) (runtime, original sdk.Output, username string, err error) {
+	for i, user := range serviceUserInputs(legacy, database, environment, readOplog, leastPrivilege) {
 		runtime, err = createDatabaseUser(ctx, user, params)
 		if err != nil {
 			return nil, nil, "", err

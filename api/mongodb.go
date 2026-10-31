@@ -11,6 +11,10 @@ import (
 const ResourceTypeMongodbAtlas = "mongodb-atlas"
 
 type AtlasConfig struct {
+	// Opt-in hardening; omitted flags preserve existing resources and credentials.
+	DisableDefaultPublicAccess bool `json:"disableDefaultPublicAccess,omitempty" yaml:"disableDefaultPublicAccess,omitempty"`
+	LeastPrivilegeUsers        bool `json:"leastPrivilegeUsers,omitempty" yaml:"leastPrivilegeUsers,omitempty"`
+
 	// OplogReaders explicitly lists consuming stack/environment identities allowed
 	// read access to local. That access exposes all databases' writes.
 	OplogReaders []string `json:"oplogReaders,omitempty" yaml:"oplogReaders,omitempty"`
@@ -74,10 +78,18 @@ type AtlasNetworkConfig struct {
 	AllowCidrs          *[]string            `json:"allowCidrs,omitempty" yaml:"allowCidrs,omitempty"` // format "0.0.0.0/0"
 }
 
-// AllowsAllIPs requires an explicit compatibility opt-in. A missing or empty
-// networkConfig creates no public access-list entry.
+// AllowsAllIPs preserves the legacy public-access default when networkConfig is absent.
 func (c *AtlasNetworkConfig) AllowsAllIPs() bool {
-	return c != nil && c.AllowAllIps != nil && *c.AllowAllIps
+	return c == nil || (c.AllowAllIps != nil && *c.AllowAllIps)
+}
+
+// AllowsPublicAccess uses a top-level scalar flag so the legacy default does
+// not depend on nested-map transport support.
+func (c *AtlasConfig) AllowsPublicAccess() bool {
+	if c.NetworkConfig == nil && c.DisableDefaultPublicAccess {
+		return false
+	}
+	return c.NetworkConfig.AllowsAllIPs()
 }
 
 type PrivateLinkEndpoint struct {

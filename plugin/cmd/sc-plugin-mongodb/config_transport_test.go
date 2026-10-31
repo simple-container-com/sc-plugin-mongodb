@@ -44,3 +44,19 @@ func TestAtlasRejectsInvalidCompleteConfig(t *testing.T) {
 		t.Fatal("invalid complete config ignored")
 	}
 }
+
+func TestLegacyAndHardenedNetworkDefaultsCrossScalarTransport(t *testing.T) {
+	for _, disable := range []bool{false, true} {
+		inputs := map[string]*scpluginv1.InputValue{}
+		if disable {
+			inputs["disableDefaultPublicAccess"] = &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BoolValue{BoolValue: true}}
+		}
+		got := &mongoApi.AtlasConfig{}
+		if err := decodeInputsAs(inputs, got); err != nil {
+			t.Fatal(err)
+		}
+		if got.NetworkConfig != nil || got.AllowsPublicAccess() == disable {
+			t.Fatalf("legacy/scalar default changed: %+v", got)
+		}
+	}
+}

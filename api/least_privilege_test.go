@@ -7,7 +7,7 @@ import "testing"
 
 func TestNetworkAccessRequiresExplicitOptIn(t *testing.T) {
 	no, yes := false, true
-	for _, cfg := range []*AtlasNetworkConfig{nil, {}, {AllowAllIps: &no}} {
+	for _, cfg := range []*AtlasNetworkConfig{{}, {AllowAllIps: &no}} {
 		if cfg.AllowsAllIPs() {
 			t.Fatalf("open by default: %+v", cfg)
 		}
@@ -30,5 +30,17 @@ func TestOplogReadersAreScopedToStackAndEnvironment(t *testing.T) {
 	cfg.OplogReaders = []string{"*", "meeting"}
 	if cfg.AllowsOplog("meeting", "staging") {
 		t.Fatal("wildcard/bare name must not grant access")
+	}
+}
+
+func TestLegacyPublicAccessAndOptIn(t *testing.T) {
+	if !(&AtlasConfig{}).AllowsPublicAccess() {
+		t.Fatal("missing networkConfig must retain 0.0.0.0/0")
+	}
+	if (&AtlasConfig{DisableDefaultPublicAccess: true}).AllowsPublicAccess() {
+		t.Fatal("opt in ignored")
+	}
+	if (&AtlasConfig{NetworkConfig: &AtlasNetworkConfig{}}).AllowsPublicAccess() {
+		t.Fatal("explicit networkConfig changed")
 	}
 }
