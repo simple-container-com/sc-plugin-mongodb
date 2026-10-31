@@ -88,6 +88,16 @@ func (p *mongoPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1
 		MonitorAddr: h.GetMonitorAddress(),
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
+		// DryRun landed on RequestHeader via api PR adding dry_run to the
+		// plugin bus. Without this the plugin's pctx thinks DryRun() is
+		// always false, which breaks `if ctx.DryRun()` preview-skip
+		// guards. mongodb has no such guard today, but setting it keeps
+		// the pctx aligned with reality for future consumers and is
+		// identical to the fix sc-plugin-cloudflare needs for its Pages
+		// uploader hang. Zero-value (false) on older SC cores is exactly
+		// what the pctx had before this field existed, so no behaviour
+		// change for operators on old SC.
+		DryRun: h.GetDryRun(),
 	})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
@@ -207,8 +217,20 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 		return nil, derr
 	}
 	urn := waitForRef(out.Ref)
-	p.progress.Info("provision", fmt.Sprintf("cluster %q registered (urn=%s)", req.GetResourceName(), urn))
-	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	// Harvest the pctx's exports and hand them back on the wire.
+	// SC core re-exports them against its OWN pctx so they land in the
+	// parent stack root's RegisterResourceOutputs call — WITHOUT this,
+	// `ctx.Export(...)` on the plugin's pctx stays in the plugin and
+	// never reaches the parent stack root; every downstream
+	// `uses: [mongodb]` compute-processor's `GetParentOutput(...)`
+	// returns empty. Live-caught 2026-10-31: parent `/forge/infra` had
+	// 6 output keys, all templates, zero plugin resource keys.
+	exports, exportsErr := harvestPctxExports(ctx, pctx)
+	if exportsErr != nil {
+		p.progress.Warn("provision", "harvest exports: "+exportsErr.Error())
+	}
+	p.progress.Info("provision", fmt.Sprintf("cluster %q registered (urn=%s, exports=%d)", req.GetResourceName(), urn, len(exports)))
+	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: exports}, nil
 }
 
 func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
@@ -544,4 +566,98 @@ func decodeParentInfo(raw []byte) (*pApi.ParentInfo, error) {
 		return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
 	}
 	return parent, nil
+}
+
+// harvestPctxExports reads every `pctx.Export(k, v)` call made during the
+// RPC handler and converts each value into an InputValue the wire can carry.
+// Awaits every sdk.Output so a late-resolving ApplyT chain (e.g.
+// Cluster.MongoUri, which only resolves after the register goroutine
+// completes) still gets its concrete string into the response.
+//
+// SC core re-exports whatever this returns onto its OWN pctx — that is what
+// lands the keys in the parent stack root's `RegisterResourceOutputs`.
+// Without this, the plugin's exports stay in the plugin and the parent root
+// has no plugin keys (live-caught 2026-10-31 after the mongodb cascade adopt;
+// see Addendum U of 04-no-destroy-invariant.md).
+func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scpluginv1.InputValue, error) {
+	raw := pctx.GetCurrentExportMap()
+	out := make(map[string]*scpluginv1.InputValue, len(raw))
+	for k, v := range raw {
+		plain, err := awaitInputToPlain(ctx, v)
+		if err != nil {
+			return out, errors.Wrapf(err, "await export %q", k)
+		}
+		if iv := anyToInputValue(plain); iv != nil {
+			out[k] = iv
+		}
+	}
+	return out, nil
+}
+
+// awaitInputToPlain resolves a Pulumi Input (which may be a bare value, a
+// pointer, an sdk.Output / sdk.StringOutput / IDOutput, …) to its concrete
+// Go value by awaiting any Output machinery and dereferencing any pointers.
+func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	// Easy cases first — Pulumi's primitive Input wrappers resolve inline.
+	switch tv := v.(type) {
+	case sdk.String:
+		return string(tv), nil
+	case sdk.Bool:
+		return bool(tv), nil
+	case sdk.Int:
+		return int(tv), nil
+	case sdk.Float64:
+		return float64(tv), nil
+	}
+	// Pulumi's Output types all implement sdk.Output; await their value.
+	if out, ok := v.(sdk.Output); ok {
+		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
+		if aerr != nil {
+			return nil, aerr
+		}
+		return unwrapPlain(resolved.Value), nil
+	}
+	return nil, nil
+}
+
+func unwrapPlain(v any) any {
+	// Common Pulumi concrete values are plain Go types; nothing to do.
+	switch tv := v.(type) {
+	case sdk.URN:
+		return string(tv)
+	case sdk.ID:
+		return string(tv)
+	}
+	return v
+}
+
+// anyToInputValue is a thin mirror of api/pkg/clouds/pulumi.toInputValue —
+// kept local because that helper is unexported and this plugin only needs
+// the scalar branches today. Returns nil for a nil value (SC core treats
+// the absent key as a no-op, matching api/pkg/plugin.InputValueToPlain).
+func anyToInputValue(v any) *scpluginv1.InputValue {
+	if v == nil {
+		return nil
+	}
+	switch sv := v.(type) {
+	case string:
+		if sv == "" {
+			return nil
+		}
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: sv}}
+	case bool:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BoolValue{BoolValue: sv}}
+	case int:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: int64(sv)}}
+	case int64:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: sv}}
+	case float64:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_DoubleValue{DoubleValue: sv}}
+	case []byte:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BytesValue{BytesValue: sv}}
+	}
+	return nil
 }

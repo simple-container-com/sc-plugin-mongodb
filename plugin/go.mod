@@ -9,7 +9,7 @@ require (
 	github.com/pulumi/pulumi-random/sdk/v4 v4.21.0
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261029105927-d49ee7927310
+	github.com/simple-container-com/api v0.0.0-20261031185006-87975b87c071
 	github.com/simple-container-com/sc-plugin-mongodb/api v0.0.0
 	go.mongodb.org/mongo-driver v1.17.9
 	gopkg.in/yaml.v3 v3.0.1
