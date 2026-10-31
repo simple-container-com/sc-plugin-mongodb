@@ -69,6 +69,7 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		return nil, errors.Errorf("mongo uri is empty for %q (%q)", stack.Name, mongoUriExport)
 	}
 
+	readOplog := mongoConfig.AllowsOplog(stack.Name, params.ParentStack.StackEnv)
 	appendContextParams := appendParams{
 		stack:           stack,
 		collector:       collector,
@@ -79,6 +80,7 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		mongoUri:        mongoUri,
 		provisionParams: params,
 		suffix:          suffix,
+		readOplog:       readOplog,
 	}
 	if params.ParentStack.UsesResource {
 		if err := appendUsesResourceContext(ctx, appendContextParams); err != nil {
@@ -110,39 +112,29 @@ type appendParams struct {
 	provisionParams pApi.ProvisionParams
 	dependency      api.StackConfigDependencyResource
 	suffix          string
+	readOplog       bool
 }
 
 func appendUsesResourceContext(ctx *sdk.Context, params appendParams) error {
 	// set both dbname and user name to stack name
 	dbName := params.stack.Name
-	userName := params.stack.Name
+	legacyUserName := params.stack.Name
 
-	dbUser, err := createDatabaseUser(ctx, dbUserInput{
+	dbUser, originalUser, userName, err := createServiceDatabaseUsers(ctx, dbUserInput{
 		clusterName: params.clusterName,
 		projectId:   params.projectId,
 		dbUri:       params.mongoUri,
-		username:    params.stack.Name,
-		roles: []dbRole{
-			{
-				dbName: dbName,
-				role:   "dbAdmin",
-			},
-			{
-				dbName: dbName,
-				role:   "readWrite",
-			},
-			{
-				dbName: "local",
-				role:   "read",
-			},
-		},
-		suffix: params.suffix,
-	}, params.provisionParams)
+		username:    legacyUserName,
+		suffix:      params.suffix,
+	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.provisionParams)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create service user for database %q", dbName)
 	}
 	if dbUser != nil {
-		ctx.Export(fmt.Sprintf("%s%s-service-user", params.clusterName, params.suffix), dbUser)
+		if params.readOplog {
+			ctx.Export(fmt.Sprintf("%s-%s-oplog-user", params.clusterName, userName), dbUser)
+		}
+		ctx.Export(fmt.Sprintf("%s%s-service-user", params.clusterName, params.suffix), originalUser)
 
 		params.collector.AddOutput(ctx, dbUser.ApplyT(func(dbUserOut any) (any, error) {
 			dbUserOutJson, ok := dbUserOut.(string)
@@ -166,19 +158,10 @@ func appendUsesResourceContext(ctx *sdk.Context, params appendParams) error {
 
 			mongoUri := AppendUserPasswordAndDBToMongoUri(params.mongoUri, userName, dbUser.Password, dbName)
 
-			// oplog uri is necessary for apps that would like to read mongo's oplog
-			oplogMongoUri := AppendUserPasswordAndDBToMongoUri(params.mongoUri, userName, dbUser.Password, "local")
-
 			params.collector.AddSecretEnvVariableIfNotExist(util.ToEnvVariableName("MONGO_URI"), mongoUri,
 				params.input.Descriptor.Type, params.input.Descriptor.Name, params.provisionParams.ParentStack.StackName)
 
-			params.collector.AddResourceTplExtension(params.input.Descriptor.Name, map[string]string{
-				"uri":      mongoUri,
-				"dbName":   dbName,
-				"password": dbUser.Password,
-				"user":     userName,
-				"oplogUri": oplogMongoUri,
-			})
+			params.collector.AddResourceTplExtension(params.input.Descriptor.Name, serviceDatabaseTemplate(params.mongoUri, userName, dbUser.Password, dbName, params.readOplog))
 
 			return nil, nil
 		}))
@@ -189,36 +172,25 @@ func appendUsesResourceContext(ctx *sdk.Context, params appendParams) error {
 
 func appendDependsOnResourceContext(ctx *sdk.Context, params appendParams) error {
 	ownerStackName := pApi.CollapseStackReference(params.dependency.Owner)
-	userName := fmt.Sprintf("%s--%s%s", params.stack.Name, params.dependency.Name, params.suffix)
+	legacyUserName := fmt.Sprintf("%s--%s%s", params.stack.Name, params.dependency.Name, params.suffix)
 	dbEnv := lo.If(params.provisionParams.ParentStack.ResourceEnv != "", params.provisionParams.ParentStack.ResourceEnv).Else(params.input.StackParams.Environment)
 	dbName := pApi.StackNameInEnv(ownerStackName, dbEnv)
 
-	dbUser, err := createDatabaseUser(ctx, dbUserInput{
+	dbUser, originalUser, userName, err := createServiceDatabaseUsers(ctx, dbUserInput{
 		clusterName: params.clusterName,
 		projectId:   params.projectId,
 		dbUri:       params.mongoUri,
-		username:    userName,
-		roles: []dbRole{
-			{
-				dbName: dbName,
-				role:   "dbAdmin",
-			},
-			{
-				dbName: dbName,
-				role:   "readWrite",
-			},
-			{
-				dbName: "local",
-				role:   "read",
-			},
-		},
-		suffix: params.suffix,
-	}, params.provisionParams)
+		username:    legacyUserName,
+		suffix:      params.suffix,
+	}, dbName, params.provisionParams.ParentStack.StackEnv, params.readOplog, params.provisionParams)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create service user for database %q", dbName)
 	}
 	if dbUser != nil {
-		ctx.Export(fmt.Sprintf("%s--to--%s--%s%s", params.clusterName, ownerStackName, params.dependency.Resource, params.suffix), dbUser)
+		if params.readOplog {
+			ctx.Export(fmt.Sprintf("%s-%s-oplog-user", params.clusterName, userName), dbUser)
+		}
+		ctx.Export(fmt.Sprintf("%s--to--%s--%s%s", params.clusterName, ownerStackName, params.dependency.Resource, params.suffix), originalUser)
 
 		params.collector.AddOutput(ctx, dbUser.ApplyT(func(dbUserOut any) (any, error) {
 			params.provisionParams.Log.Info(ctx.Context(), "Creating mongo user %q", userName)
@@ -240,19 +212,10 @@ func appendDependsOnResourceContext(ctx *sdk.Context, params appendParams) error
 
 			mongoUri := AppendUserPasswordAndDBToMongoUri(params.mongoUri, userName, dbUser.Password, dbName)
 
-			// oplog uri is necessary for apps that would like to read mongo's oplog
-			oplogMongoUri := AppendUserPasswordAndDBToMongoUri(params.mongoUri, userName, dbUser.Password, "local")
-
 			params.collector.AddSecretEnvVariableIfNotExist(util.ToEnvVariableName(fmt.Sprintf("MONGO_DEP_%s_URI", ownerStackName)), mongoUri,
 				params.input.Descriptor.Type, params.input.Descriptor.Name, params.provisionParams.ParentStack.StackName)
 
-			params.collector.AddDependencyTplExtension(params.dependency.Name, params.input.Descriptor.Name, map[string]string{
-				"uri":      mongoUri,
-				"dbName":   dbName,
-				"password": dbUser.Password,
-				"user":     userName,
-				"oplogUri": oplogMongoUri,
-			})
+			params.collector.AddDependencyTplExtension(params.dependency.Name, params.input.Descriptor.Name, serviceDatabaseTemplate(params.mongoUri, userName, dbUser.Password, dbName, params.readOplog))
 
 			return nil, nil
 		}))

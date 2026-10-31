@@ -67,3 +67,70 @@ plugin clones from). See the authoring guide at
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Atlas least privilege (S-04)
+
+A consuming stack's generated user keeps `dbAdmin` and `readWrite` on its own
+database. It no longer receives `read` on `local` or an `oplogUri` template
+extension by default. Applications that require the oplog must be explicitly
+listed in the Atlas resource config in `server.yaml` (works for both `uses` and `dependencies`):
+
+```yaml
+# Inside the mongodb-atlas resource config:
+oplogReaders:
+  - meeting-app/staging
+networkConfig:
+  allowCidrs: [203.0.113.10/32] # replace with actual application/NAT egress IPs
+```
+
+Each reader is exactly `stack-name/consuming-environment`, not the parent resource
+environment; wildcards and bare stack names grant nothing. Other stacks and
+other environments do not gain oplog access. This is resource-side authorization
+because the compute-process plugin receives the resource config, not the
+consuming stack's client descriptor.
+
+**This grants visibility into writes from every database in the cluster,
+including other environments.** Use only with an intentional trust boundary;
+prefer a dedicated cluster for applications that need the oplog.
+Existing oplog-dependent stacks must be listed before upgrading. The existing
+user retains its name/credentials and loses `read@local` in place. An explicit
+reader additionally gets a separate environment-specific `sc-oplog-<hash>`
+principal; its MONGO_USER/PASSWORD/URI and template extensions switch together
+to that principal. The original service-user export is retained for database
+cleanup. Environments sharing a legacy username never share the privileged
+principal. Revoking access requires removing the reader and redeploying that
+consuming stack so its privileged user is removed and credentials switch back.
+
+Public access now defaults to deny: omitted `networkConfig`, `{}`, and
+`allowAllIps: false` create no open access-list entry. Configure the resource in
+`server.yaml` with your applications' outbound CIDRs before upgrading:
+
+```yaml
+# Inside the mongodb-atlas resource config:
+networkConfig:
+  allowCidrs: [203.0.113.10/32] # replace with actual application/NAT egress IPs
+```
+
+`networkConfig: {allowAllIps: true}` explicitly preserves the old open behavior
+when migration cannot be completed first; it allows the entire IPv4 internet
+and is discouraged. Existing managed implicit `0.0.0.0/0` entries will be removed
+on the next provision unless this opt-in is set. If `deletionProtection` was
+previously enabled, the old public access-list resource is protected too:
+unprotect **only that access-list URN in Pulumi state** before applying the
+removal. Keep the project and cluster protected. Alternatively, temporarily set
+`allowAllIps: true` while arranging this state-only migration; leaving it set
+retains public access. Access lists are project-wide; entries managed outside this stack (including adopted project entries) remain
+unchanged, so this does not remove independently managed public access.
+
+The plugin already supports CIDRs, so deny by default is feasible and no new
+network configuration field is needed. AWS VPC peering/PrivateLink provisioning
+is not added here: PrivateLink remains explicitly unsupported pending the
+cross-plugin PeerInvoke integration described above. CIDR allowlisting is the
+supported network boundary in this release.
+
+Structured config crosses older scalar-only plugin transports through a JSON
+fallback emitted by this plugin's `/api` config module and read by the plugin
+binary. Upgrade both the config module used by SC and the plugin binary together;
+rebuild SC with this `/api` revision when its embedded module predates this change.
+This prevents CIDR and reader lists from being silently dropped. No core protocol
+change is required.

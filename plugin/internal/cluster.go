@@ -188,18 +188,16 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 					return nil, errors.Wrapf(err, "failed to create mongodb cidr block %q stack %q", cidrBlock, stack.Name)
 				}
 			}
-		} else {
-			return nil, errors.Errorf("network configuration for MongoDB Atlas cluster %q is provided but not supported", clusterName)
 		}
 	}
 
-	// if public access was requested or network config wasn't provided
-	if networkConfig == nil || lo.FromPtr(networkConfig.AllowAllIps) {
+	// Public access requires an explicit opt-in; nil/empty config denies access.
+	if networkConfig.AllowsAllIPs() {
 		params.Log.Info(ctx.Context(), "configure MongoDB Atlas ip access list for cluster %q in stack %q in %q",
 			clusterName, input.StackParams.StackName, input.StackParams.Environment)
 		_, err := mongodbatlas.NewProjectIpAccessList(ctx, fmt.Sprintf("%s-ip-access-list", clusterName), &mongodbatlas.ProjectIpAccessListArgs{
 			CidrBlock: sdk.StringPtr("0.0.0.0/0"),
-			Comment:   sdk.StringPtr("Allow all access to the cluster (TODO: restrict to our cluster only)"),
+			Comment:   sdk.StringPtr("Public access explicitly enabled with networkConfig.allowAllIps"),
 			ProjectId: projectId,
 		}, opts...)
 		if err != nil {
