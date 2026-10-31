@@ -44,6 +44,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
@@ -120,6 +121,18 @@ func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequ
 		p.progress.Error("provider", err.Error())
 		return nil, err
 	}
+	// Drain pending RegisterResource RPCs before returning — see drain.go.
+	// Without this, the provider register goroutine may not have reached
+	// the monitor when the handler returns, so SC core sees zero URNs
+	// for this plugin and plans a destroy of its state entries. The
+	// 2026-10-31 cascade delete of Atlas project 697a574e90d5387e4a889f5f
+	// was this bug plus the pctx-close bug compounded. The aws plugin
+	// has an identical drain for the same reason — see
+	// sc-plugin-aws/plugin/cmd/sc-plugin-aws/main.go.
+	if derr := drainContext(pctx); derr != nil {
+		p.progress.Error("provider", "drain: "+derr.Error())
+		return nil, derr
+	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provider", fmt.Sprintf("provider ready (urn=%s)", urn))
 	return &scpluginv1.ProviderResponse{ProviderUrn: urn}, nil
@@ -181,6 +194,17 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
+	}
+	// Drain pending RegisterResource RPCs — see drain.go and the
+	// Provider() comment above. The Cluster/DatabaseUser/RandomPassword/
+	// BackupSchedule/ProjectIpAccess registrations happen in
+	// `mongoInternal.Cluster`'s goroutines; without this drain the
+	// handler returns before any of them reach the monitor, and the
+	// engine sees them as missing-from-state → cascade-delete at apply
+	// time. 2026-10-31 incident, parent provision 41195331666.
+	if derr := drainContext(pctx); derr != nil {
+		p.progress.Error("provision", "drain: "+derr.Error())
+		return nil, derr
 	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provision", fmt.Sprintf("cluster %q registered (urn=%s)", req.GetResourceName(), urn))
@@ -248,6 +272,15 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	if err := collector.AwaitOutputs(ctx); err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
+	}
+	// AwaitOutputs blocks until each ApplyT resolves, but the DatabaseUser
+	// + RandomPassword RegisterResource RPCs ride a separate goroutine
+	// path that AwaitOutputs doesn't touch. Drain those too, same reason
+	// as Provider/Provision above (see drain.go). The 2026-10-31 incident
+	// hit both call sites; both get the drain.
+	if derr := drainContext(pctx); derr != nil {
+		p.progress.Error("compute-process", "drain: "+derr.Error())
+		return nil, derr
 	}
 
 	resp := collector.ToResponse()
@@ -394,6 +427,19 @@ func (p *mongoPlugin) computeProvider(pctx *sdk.Context, stack api.Stack, req *s
 
 // waitForRef blocks until a Pulumi Output in a resource ref resolves —
 // same reason + same shape as sc-plugin-cloudflare/yandex/cloudru.
+//
+// IMPORTANT: an unhandled `ref` type falls into `default` which Sprintf's
+// the pointer without awaiting ANY URN. That is NOT just a cosmetic
+// miss — Pulumi SDK schedules RegisterResource on a goroutine triggered
+// by the first consumer of the Resource's URN output; if nothing ever
+// consumes it in-handler, the register goroutine may never fire its
+// gRPC call to the monitor. drainContext() only drains RPCs that have
+// *started*; if the SDK is still waiting for the URN-output consumer
+// to kick things off, drain sees `rpcs == 0` and returns immediately.
+// We saw this live post-cascade on 2026-10-31: the Cluster URN was
+// built, the handler returned "cluster registered", drain returned,
+// and the Pulumi monitor never got a RegisterResource call for the
+// Cluster. ALWAYS add a case here for a new ref type.
 func waitForRef(ref any) string {
 	if ref == nil {
 		return ""
@@ -401,6 +447,29 @@ func waitForRef(ref any) string {
 	switch r := ref.(type) {
 	case string:
 		return r
+	case *mongoInternal.ClusterOutput:
+		// The Provision handler returns a *ClusterOutput wrapping the Cluster
+		// + Project + optional PrivateLink. Awaiting EACH non-nil resource's
+		// URN forces the register goroutine to actually dispatch the gRPC
+		// RegisterResource — same pattern as sc-plugin-cloudflare/await.go.
+		// Return the Cluster URN as the primary ref (it is what SC core
+		// records in the sidecar's state).
+		ctx := context.Background()
+		if r.Project != nil {
+			_, _ = internals.UnsafeAwaitOutput(ctx, r.Project.URN())
+		}
+		if r.PrivateLinkEndpointService != nil {
+			_, _ = internals.UnsafeAwaitOutput(ctx, r.PrivateLinkEndpointService.URN())
+		}
+		if r.Cluster != nil {
+			out, err := internals.UnsafeAwaitOutput(ctx, r.Cluster.URN())
+			if err == nil {
+				if urn, ok := out.Value.(sdk.URN); ok {
+					return string(urn)
+				}
+			}
+		}
+		return ""
 	case sdk.ProviderResource:
 		ch := make(chan string, 1)
 		r.URN().ApplyT(func(u sdk.URN) sdk.URN {
