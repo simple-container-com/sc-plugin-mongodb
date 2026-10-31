@@ -44,7 +44,6 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
@@ -132,10 +131,44 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 		return nil, errors.Wrap(err, "decode AtlasConfig from Provision inputs")
 	}
 
+	// Build the Atlas provider inline. Without this, `params.Provider` is
+	// nil at `cluster.go:68` (`sdk.Provider(params.Provider)`), which
+	// resolves to `Providers(nil).applyResourceOption(...)` and calls
+	// `nil.getPackage()` on the first Pulumi resource option application
+	// — nil-pointer dereference, plugin process exits status 2, SC core
+	// sees `rpc error: EOF`. Mirrors sc-plugin-aws's Provision which builds
+	// its provider the same way at `main.go:281` (`buildAwsProvider`).
+	//
+	// The resource name must match what the in-tree code produced so URNs
+	// stay stable across the plugin split — see computeProvider() below for
+	// the formula source.
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+	providerResName := fmt.Sprintf("%s--%s--%s--%s--provider",
+		stack.Name, req.GetResourceType(), req.GetResourceName(), req.GetHeader().GetEnvironment())
+	provOut, err := mongoInternal.Provider(pctx, stack, api.ResourceInput{
+		Descriptor: &api.ResourceDescriptor{
+			Type:   mongoApi.ProviderType,
+			Name:   providerResName,
+			Config: api.Config{Config: cfg},
+		},
+		StackParams: &api.StackParams{
+			StackName:   stack.Name,
+			Environment: req.GetHeader().GetEnvironment(),
+		},
+	}, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		p.progress.Error("provision", err.Error())
+		return nil, errors.Wrap(err, "build mongodb atlas provider inside Provision")
+	}
+	provider, ok := provOut.Ref.(sdk.ProviderResource)
+	if !ok {
+		return nil, errors.Errorf("mongodb Provider returned %T, not sdk.ProviderResource", provOut.Ref)
+	}
+
 	input := resourceInputFromProvision(req, cfg)
 	// mongodb.Cluster branches internally on cfg.Adopt and delegates to
 	// AdoptCluster when the operator asked to import an existing cluster.
-	out, err := mongoInternal.Cluster(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	out, err := mongoInternal.Cluster(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
@@ -392,12 +425,25 @@ func waitForRef(ref any) string {
 }
 
 func main() {
+	// Full goroutine traces on panic. Without this, Go's default
+	// GOTRACEBACK=`single` prints only the panicking goroutine, and the
+	// stack trace is often what's needed to identify a nil-ptr root
+	// cause. sc-plugin-aws sets this for the same reason.
+	_ = os.Setenv("GOTRACEBACK", "all")
 	impl := &mongoPlugin{progress: scPlugin.NewPublisher(0)}
 	scPlugin.Serve(scPlugin.ServerConfig{
 		Impl: impl,
+		// Debug level forwards subprocess stderr (which carries panic
+		// headers + goroutine stacks via hashicorp/go-plugin's
+		// logStreamer) through SC core's hclog pipeline. Keeping it at
+		// Warn (the previous value) dropped the only diagnostic ever
+		// emitted on a plugin crash — observed empirically on forge run
+		// 41191832415 (2026-10-31) where the panic header appeared at
+		// Debug but goroutine stacks were truncated by the parent's
+		// own filter. See sc-plugin-aws main.go for the same shape.
 		Logger: hclog.New(&hclog.LoggerOptions{
 			Name:   "sc-plugin-mongodb",
-			Level:  hclog.Warn,
+			Level:  hclog.Debug,
 			Output: os.Stderr,
 		}),
 	})
