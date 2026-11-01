@@ -10,7 +10,6 @@ import (
 	"github.com/pulumi/pulumi-mongodbatlas/sdk/v3/go/mongodbatlas"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 
@@ -36,9 +35,16 @@ func AdoptCluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 		return nil, errors.Errorf("clusterName is required when adopt=true for resource %q", input.Descriptor.Name)
 	}
 
-	// Use identical naming functions as provisioning to ensure export compatibility
+	// Use identical naming functions as provisioning to ensure export compatibility.
+	// `clusterName` is the Pulumi RESOURCE NAME (used in URN) — stable across
+	// a config change that adds `clusterName:`. `exportClusterName` is the
+	// Atlas-visible cluster name (= `atlasCfg.ClusterName` for adoption) and
+	// is what export keys are prefixed with so downstream `uses: [mongodb]`
+	// lookups find them under the actual Atlas cluster name.
+	// See cluster.go for the live-caught incident this split guards against.
 	projectName := toProjectName(stack.Name, input)
 	clusterName := toClusterName(stack.Name, input)
+	exportClusterName := atlasCfg.ClusterName
 
 	// CRITICAL SAFETY WARNING for production environments
 	// Use flexible environment detection instead of hardcoded names
@@ -135,11 +141,14 @@ func AdoptCluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 		return nil, errors.Wrapf(err, "failed to import MongoDB Atlas cluster %q", atlasCfg.ClusterName)
 	}
 
-	// Export the same keys as the provisioning function to ensure compute processor compatibility
+	// Export the same keys as the provisioning function to ensure compute processor compatibility.
+	// Prefix with `exportClusterName` (= atlasCfg.ClusterName) so downstream
+	// `uses: [mongodb]` consumers find the exports under the actual Atlas
+	// cluster name — not the Pulumi-truncated local resource name.
 	ctx.Export(toProjectIdExport(projectName), sdk.String(atlasCfg.ProjectId))
-	ctx.Export(toClusterIdExport(clusterName), cluster.ClusterId)
-	ctx.Export(toMongoUriExport(clusterName), cluster.MongoUri)
-	ctx.Export(toMongoUriWithOptionsExport(clusterName), cluster.MongoUriWithOptions)
+	ctx.Export(toClusterIdExport(exportClusterName), cluster.ClusterId)
+	ctx.Export(toMongoUriExport(exportClusterName), cluster.MongoUri)
+	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), cluster.MongoUriWithOptions)
 
 	// For adopted clusters, we don't create database users here - that's handled by the compute processor
 	// Export empty users list to maintain compatibility

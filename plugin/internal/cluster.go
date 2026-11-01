@@ -48,6 +48,24 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 	projectName := toProjectName(stack.Name, input)
 	clusterName := toClusterName(stack.Name, input)
 
+	// exportClusterName is the Atlas-visible cluster name — operator's custom
+	// `clusterName:` verbatim when set, else the auto-generated one.
+	// Export keys and the Atlas `Name` arg use this. The Pulumi RESOURCE
+	// NAME keeps `clusterName` (which may differ when the custom name
+	// exceeds `TrimStringMiddle`'s budget) so the URN stays stable across
+	// a config change that adds `clusterName:`. Live-caught 2026-11-01
+	// (forge-notifier deploy run 41330569069): post-cascade the forge
+	// parent added `clusterName: "infra--mongodb--staging"` for adoption,
+	// `TrimStringMiddle(., 21, "--")` renamed every export key to
+	// `infra--mon--b--staging-*`, downstream `uses: [mongodb]` lookups
+	// found nothing, the Lambda template emitted no MONGO_USER /
+	// MONGO_PASSWORD env vars, and the orphan secretsmanager secret +
+	// cloudflare CNAME + workerScript got deleted.
+	exportClusterName := clusterName
+	if atlasCfg.ClusterName != "" {
+		exportClusterName = atlasCfg.ClusterName
+	}
+
 	// Deletion protection check
 	if atlasCfg.DeletionProtection {
 		params.Log.Info(ctx.Context(), "⚠️ Deletion protection ENABLED for MongoDB cluster %q - resource will be protected from accidental deletion", clusterName)
@@ -110,7 +128,7 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 	// config field for operator ergonomics. After the 2026-10-31 cascade
 	// delete that destroyed project 697a574e90d5387e4a889f5f, this is required.
 	cluster, err := mongodbatlas.NewCluster(ctx, fmt.Sprintf("%s-cluster", clusterName), &mongodbatlas.ClusterArgs{
-		Name:                         sdk.StringPtr(clusterName),
+		Name:                         sdk.StringPtr(exportClusterName),
 		ProviderRegionName:           sdk.StringPtr(atlasCfg.Region),
 		ProviderInstanceSizeName:     sdk.String(atlasCfg.InstanceSize),
 		ClusterType:                  sdk.StringPtr("REPLICASET"),
@@ -218,13 +236,13 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 		}
 	}
 
-	ctx.Export(toClusterIdExport(clusterName), cluster.ClusterId)
+	ctx.Export(toClusterIdExport(exportClusterName), cluster.ClusterId)
 
-	ctx.Export(toMongoUriExport(clusterName), cluster.MongoUri)
+	ctx.Export(toMongoUriExport(exportClusterName), cluster.MongoUri)
 	// mongodb v1 has no PrivateLink path (above refusal), so the standard
 	// MongoUriWithOptions is always what consumers want. The PrivateLink
 	// follow-up re-adds the LookupCluster branch here.
-	ctx.Export(toMongoUriWithOptionsExport(clusterName), cluster.MongoUriWithOptions)
+	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), cluster.MongoUriWithOptions)
 
 	usersOutput := sdk.All(projectId).ApplyT(func(args []any) any {
 		return createDatabaseUsers(ctx, cluster, atlasCfg, params)
