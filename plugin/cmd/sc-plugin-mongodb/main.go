@@ -340,13 +340,21 @@ func (p *mongoPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv
 
 // decodeInputsAs lifts the plugin bus's input map into a typed struct
 // via YAML round-trip. Same pattern sc-plugin-cloudru + sc-plugin-yandex
-// use. The map covers scalar inputs; nested shapes (AtlasConfig.backup,
-// .networkConfig) survive IF the SC-core sidecar serialised them as
-// nested maps. Known gap: today's `serializeConfigToInputs` has only
-// scalar cases; a deeply nested AtlasConfig may lose fields. Follow-up:
-// extend serializeConfigToInputs or ship AtlasConfig as a JSON blob in
-// bytes_value.
+// use. AtlasConfig's scalar JSON fallback preserves structured settings even
+// with SC cores that transmit only scalar InputValues.
 func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
+	// AtlasConfig emits a scalar JSON fallback because older SC cores omit
+	// maps/lists from the bus. Prefer the complete payload when available.
+	if payload := inputs["atlasConfigJson"]; payload != nil {
+		raw := payload.GetStringValue()
+		if raw == "" {
+			raw = string(payload.GetBytesValue())
+		}
+		if err := json.Unmarshal([]byte(raw), out); err != nil {
+			return errors.Wrap(err, "decode complete Atlas config")
+		}
+		return nil
+	}
 	plain := make(map[string]any, len(inputs))
 	for k, v := range inputs {
 		switch x := v.GetValue().(type) {

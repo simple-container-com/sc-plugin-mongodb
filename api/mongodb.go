@@ -3,11 +3,22 @@
 
 package mongodb
 
-import "github.com/simple-container-com/api/pkg/api"
+import (
+	"encoding/json"
+	"github.com/simple-container-com/api/pkg/api"
+)
 
 const ResourceTypeMongodbAtlas = "mongodb-atlas"
 
 type AtlasConfig struct {
+	// Opt-in hardening; omitted flags preserve existing resources and credentials.
+	DisableDefaultPublicAccess bool `json:"disableDefaultPublicAccess,omitempty" yaml:"disableDefaultPublicAccess,omitempty"`
+	LeastPrivilegeUsers        bool `json:"leastPrivilegeUsers,omitempty" yaml:"leastPrivilegeUsers,omitempty"`
+
+	// OplogReaders explicitly lists consuming stack/environment identities allowed
+	// read access to local. That access exposes all databases' writes.
+	OplogReaders []string `json:"oplogReaders,omitempty" yaml:"oplogReaders,omitempty"`
+
 	Admins         []string                      `json:"admins" yaml:"admins"`
 	Developers     []string                      `json:"developers" yaml:"developers"`
 	InstanceSize   string                        `json:"instanceSize" yaml:"instanceSize"`
@@ -32,10 +43,53 @@ type AtlasConfig struct {
 	NamingStrategyVersion *int `json:"namingStrategyVersion,omitempty" yaml:"namingStrategyVersion,omitempty"` // Default 2 (new), use 1 for legacy
 }
 
+// MarshalJSON preserves structured Atlas settings through older SC plugin
+// transports, which forward only top-level scalar InputValues. Newer transports
+// also retain the normal fields; atlasConfigJson is the scalar fallback.
+func (c AtlasConfig) MarshalJSON() ([]byte, error) {
+	type plain AtlasConfig
+	raw, err := json.Marshal(plain(c))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["atlasConfigJson"] = string(raw)
+	return json.Marshal(fields)
+}
+
+func (c *AtlasConfig) AllowsOplog(stack, environment string) bool {
+	if c == nil || stack == "" || environment == "" {
+		return false
+	}
+	for _, reader := range c.OplogReaders {
+		if reader == stack+"/"+environment {
+			return true
+		}
+	}
+	return false
+}
+
 type AtlasNetworkConfig struct {
 	PrivateLinkEndpoint *PrivateLinkEndpoint `json:"privateLinkEndpoint,omitempty" yaml:"privateLinkEndpoint,omitempty"`
 	AllowAllIps         *bool                `json:"allowAllIps,omitempty" yaml:"allowAllIps,omitempty"`
 	AllowCidrs          *[]string            `json:"allowCidrs,omitempty" yaml:"allowCidrs,omitempty"` // format "0.0.0.0/0"
+}
+
+// AllowsAllIPs preserves the legacy public-access default when networkConfig is absent.
+func (c *AtlasNetworkConfig) AllowsAllIPs() bool {
+	return c == nil || (c.AllowAllIps != nil && *c.AllowAllIps)
+}
+
+// AllowsPublicAccess uses a top-level scalar flag so the legacy default does
+// not depend on nested-map transport support.
+func (c *AtlasConfig) AllowsPublicAccess() bool {
+	if c.NetworkConfig == nil && c.DisableDefaultPublicAccess {
+		return false
+	}
+	return c.NetworkConfig.AllowsAllIPs()
 }
 
 type PrivateLinkEndpoint struct {
