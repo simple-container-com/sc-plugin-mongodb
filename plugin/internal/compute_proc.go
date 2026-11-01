@@ -28,7 +28,8 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		return nil, errors.Errorf("failed to convert mongodb config for %q", input.Descriptor.Type)
 	}
 
-	// For export lookups, use parent's naming strategy version (already in mongoConfig from server.yaml)
+	// The configured naming version is a preference, not proof of how the
+	// parent was provisioned. SC 2025.12.6 parents always used v1 cluster names.
 	configBasedProjectName := toProjectName(params.ParentStack.StackName, input)
 	configBasedClusterName := toClusterName(params.ParentStack.StackName, input)
 
@@ -52,21 +53,23 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 		return nil, err
 	}
 
-	// Direct export lookup using parent's naming strategy version - no fallback needed
 	projectIdExport := toProjectIdExport(configBasedProjectName)
-	projectId, err := pApi.GetParentOutput(parentRef, projectIdExport, params.ParentStack.FullReference, false)
+	projectId, _, err := parentStringOutput(parentRef, projectIdExport, params.ParentStack.FullReference)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get project id from parent stack for %q (%q)", stack.Name, projectIdExport)
 	} else if projectId == "" {
 		return nil, errors.Errorf("project id is empty for %q (%q)", stack.Name, projectIdExport)
 	}
 
-	mongoUriExport := toMongoUriWithOptionsExport(configBasedClusterName)
-	mongoUri, err := pApi.GetParentOutput(parentRef, mongoUriExport, params.ParentStack.FullReference, false)
+	mongoUri, resolvedClusterName, err := parentMongoURI(parentRef, params.ParentStack.StackName, input, params.ParentStack.FullReference)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get mongo uri from parent stack for %q (%q)", stack.Name, mongoUriExport)
+		return nil, errors.Wrapf(err, "failed to get mongo uri from parent stack for %q", stack.Name)
 	} else if mongoUri == "" {
-		return nil, errors.Errorf("mongo uri is empty for %q (%q)", stack.Name, mongoUriExport)
+		return nil, errors.Errorf("mongo uri is empty for %q (%q)", stack.Name, toMongoUriWithOptionsExport(resolvedClusterName))
+	}
+	if !mongoConfig.Adopt || mongoConfig.ClusterName == "" {
+		// Preserve the parent's database-user resource identities as well as its URI.
+		actualClusterName = resolvedClusterName
 	}
 
 	readOplog := !mongoConfig.LeastPrivilegeUsers || mongoConfig.AllowsOplog(stack.Name, params.ParentStack.StackEnv)
@@ -100,6 +103,49 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 	return &api.ResourceOutput{
 		Ref: nil,
 	}, nil
+}
+
+// parentMongoURI prefers the configured name, then tries exactly the naming
+// used by SC 2025.12.6 (which ignored custom cluster names and naming versions).
+// Only an absent output permits fallback: a malformed or empty value must not
+// silently select another cluster when both names exist in the parent.
+func parentMongoURI(ref *sdk.StackReference, stackName string, input api.ResourceInput, parentRef string) (string, string, error) {
+	clusterNames := lo.Uniq([]string{toClusterName(stackName, input), toClusterNameV1(stackName, input)})
+	exportNames := make([]string, 0, len(clusterNames))
+	for _, clusterName := range clusterNames {
+		exportName := toMongoUriWithOptionsExport(clusterName)
+		exportNames = append(exportNames, exportName)
+		uri, found, err := parentStringOutput(ref, exportName, parentRef)
+		if err != nil {
+			return "", "", err
+		}
+		if found {
+			return uri, clusterName, nil
+		}
+	}
+	return "", "", errors.Errorf("no mongo uri output found in parent %q (tried %q)", parentRef, exportNames)
+}
+
+// GetOutputDetails distinguishes missing values from secret values without
+// relying on GetParentOutput's version-dependent missing-output errors.
+func parentStringOutput(ref *sdk.StackReference, exportName, parentRef string) (string, bool, error) {
+	details, err := ref.GetOutputDetails(exportName)
+	if err != nil {
+		return "", false, errors.Wrapf(err, "failed to get output %q from %q", exportName, parentRef)
+	}
+	value := details.Value
+	if value == nil {
+		value = details.SecretValue
+	}
+	if value == nil {
+		return "", false, nil
+	}
+	s, ok := value.(string)
+	if !ok {
+		// Report the type, never the value (which may contain decrypted secrets).
+		return "", true, errors.Errorf("parent output %q from %q is %T, not string", exportName, parentRef, value)
+	}
+	return s, true, nil
 }
 
 type appendParams struct {
