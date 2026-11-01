@@ -30,6 +30,16 @@
 //     Go-module dependency. Cluster() refuses `networkConfig.privateLinkEndpoint`
 //     explicitly with a message pointing operators at that gap. Lands
 //     when sc-plugin-aws exists.
+//
+// # Lifecycle
+//
+// Every RPC handler constructs its pulumi context via
+// api/pkg/plugin/runtime.NewContext and defers runtime.Settle. Settle
+// drains every RegisterResource goroutine before the RPC response is
+// sent, folding a late-arriving error into the handler's return — the
+// pattern yandex's PR #8 arrived at, now shared library (see
+// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+// Addendums U + V for the cascade this guards against).
 package main
 
 import (
@@ -44,12 +54,12 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	mongoApi "github.com/simple-container-com/sc-plugin-mongodb/api"
 	mongoInternal "github.com/simple-container-com/sc-plugin-mongodb/plugin/internal"
@@ -80,44 +90,12 @@ func (p *mongoPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*s
 	}, nil
 }
 
-func (p *mongoPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, func(), error) {
-	if h.GetMonitorAddress() == "" {
-		return nil, nil, errors.New("no monitor address in request header")
-	}
-	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
-		MonitorAddr: h.GetMonitorAddress(),
-		Project:     h.GetProjectName(),
-		Stack:       h.GetStackName(),
-		// DryRun landed on RequestHeader via api PR adding dry_run to the
-		// plugin bus. Without this the plugin's pctx thinks DryRun() is
-		// always false, which breaks `if ctx.DryRun()` preview-skip
-		// guards. mongodb has no such guard today, but setting it keeps
-		// the pctx aligned with reality for future consumers and is
-		// identical to the fix sc-plugin-cloudflare needs for its Pages
-		// uploader hang. Zero-value (false) on older SC cores is exactly
-		// what the pctx had before this field existed, so no behaviour
-		// change for operators on old SC.
-		DryRun: h.GetDryRun(),
-	})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
-	}
-	return pctx, func() { pctx.Close() }, nil
-}
-
-func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (resp *scpluginv1.ProviderResponse, err error) {
+	rctx, err := runtime.NewContext(ctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx here. See the aws plugin's identical note at
-	// sc-plugin-aws/plugin/cmd/sc-plugin-aws/main.go:222 and Addendum
-	// P/Q/R of 04-no-destroy-invariant.md: closing the context before
-	// Pulumi's background RegisterResource goroutines have talked to
-	// the monitor drops every in-flight registration silently, and the
-	// engine then plans a destroy of every pre-existing state entry.
-	// This is the exact bug that cascade-deleted the fleet's shared
-	// Atlas project on 2026-10-31 (parent provision 41195331666).
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("provider", fmt.Sprintf("initialising mongodb-atlas provider for %q", req.GetProviderResourceName()))
 
 	cfg := &mongoApi.AtlasConfig{}
@@ -126,36 +104,22 @@ func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequ
 	}
 
 	input := providerInput(req)
-	out, err := mongoInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	out, err := mongoInternal.Provider(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
 	if err != nil {
 		p.progress.Error("provider", err.Error())
 		return nil, err
-	}
-	// Drain pending RegisterResource RPCs before returning — see drain.go.
-	// Without this, the provider register goroutine may not have reached
-	// the monitor when the handler returns, so SC core sees zero URNs
-	// for this plugin and plans a destroy of its state entries. The
-	// 2026-10-31 cascade delete of Atlas project 697a574e90d5387e4a889f5f
-	// was this bug plus the pctx-close bug compounded. The aws plugin
-	// has an identical drain for the same reason — see
-	// sc-plugin-aws/plugin/cmd/sc-plugin-aws/main.go.
-	if derr := drainContext(pctx); derr != nil {
-		p.progress.Error("provider", "drain: "+derr.Error())
-		return nil, derr
 	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provider", fmt.Sprintf("provider ready (urn=%s)", urn))
 	return &scpluginv1.ProviderResponse{ProviderUrn: urn}, nil
 }
 
-func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (resp *scpluginv1.ProvisionResponse, err error) {
+	rctx, err := runtime.NewContext(ctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx — see Provider() above. The 2026-10-31 cascade
-	// delete of project 697a574e90d5387e4a889f5f on parent provision
-	// 41195331666 was this exact bug firing from this exact function.
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("provision", fmt.Sprintf("provisioning mongodb cluster %q", req.GetResourceName()))
 
 	cfg := &mongoApi.AtlasConfig{}
@@ -169,7 +133,7 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 	// `nil.getPackage()` on the first Pulumi resource option application
 	// — nil-pointer dereference, plugin process exits status 2, SC core
 	// sees `rpc error: EOF`. Mirrors sc-plugin-aws's Provision which builds
-	// its provider the same way at `main.go:281` (`buildAwsProvider`).
+	// its provider the same way.
 	//
 	// The resource name must match what the in-tree code produced so URNs
 	// stay stable across the plugin split — see computeProvider() below for
@@ -177,7 +141,7 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
 	providerResName := fmt.Sprintf("%s--%s--%s--%s--provider",
 		stack.Name, req.GetResourceType(), req.GetResourceName(), req.GetHeader().GetEnvironment())
-	provOut, err := mongoInternal.Provider(pctx, stack, api.ResourceInput{
+	provOut, err := mongoInternal.Provider(rctx.Pulumi, stack, api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   mongoApi.ProviderType,
 			Name:   providerResName,
@@ -200,32 +164,22 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 	input := resourceInputFromProvision(req, cfg)
 	// mongodb.Cluster branches internally on cfg.Adopt and delegates to
 	// AdoptCluster when the operator asked to import an existing cluster.
-	out, err := mongoInternal.Cluster(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+	out, err := mongoInternal.Cluster(rctx.Pulumi, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
 	}
-	// Drain pending RegisterResource RPCs — see drain.go and the
-	// Provider() comment above. The Cluster/DatabaseUser/RandomPassword/
-	// BackupSchedule/ProjectIpAccess registrations happen in
-	// `mongoInternal.Cluster`'s goroutines; without this drain the
-	// handler returns before any of them reach the monitor, and the
-	// engine sees them as missing-from-state → cascade-delete at apply
-	// time. 2026-10-31 incident, parent provision 41195331666.
-	if derr := drainContext(pctx); derr != nil {
-		p.progress.Error("provision", "drain: "+derr.Error())
-		return nil, derr
-	}
 	urn := waitForRef(out.Ref)
 	// Harvest the pctx's exports and hand them back on the wire.
 	// SC core re-exports them against its OWN pctx so they land in the
-	// parent stack root's RegisterResourceOutputs call — WITHOUT this,
-	// `ctx.Export(...)` on the plugin's pctx stays in the plugin and
-	// never reaches the parent stack root; every downstream
-	// `uses: [mongodb]` compute-processor's `GetParentOutput(...)`
-	// returns empty. Live-caught 2026-10-31: parent `/forge/infra` had
-	// 6 output keys, all templates, zero plugin resource keys.
-	exports, exportsErr := harvestPctxExports(ctx, pctx)
+	// parent stack root's RegisterResourceOutputs call. Settle has
+	// already drained every RegisterResource goroutine by the time this
+	// deferred teardown fires, but harvest reads the current export map
+	// which is populated inside mongoInternal.Cluster; so we must run
+	// harvest BEFORE Settle fires (i.e. before this handler returns).
+	// Live-caught 2026-10-31: parent `/forge/infra` had 6 output keys,
+	// all templates, zero plugin resource keys.
+	exports, exportsErr := runtime.HarvestExports(ctx, rctx.Pulumi)
 	if exportsErr != nil {
 		p.progress.Warn("provision", "harvest exports: "+exportsErr.Error())
 	}
@@ -233,21 +187,18 @@ func (p *mongoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRe
 	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: exports}, nil
 }
 
-func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
+	rctx, err := runtime.NewContext(ctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx — same reason as Provider/Provision above.
-	// ComputeProcess also registers a DatabaseUser + a RandomPassword
-	// via createDatabaseUser inside appendUsesResourceContext's ApplyT,
-	// which racecloses the same way the Provision registrations did.
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("compute-process", fmt.Sprintf("resource=%q type=%q", req.GetResourceName(), req.GetResourceType()))
 
 	// ClusterComputeProcessor consumes params.ParentStack. v2 proto
 	// packs it as ParentInfoJson — unmarshal back into the Go struct the
 	// in-tree code expects.
-	parent, err := decodeParentInfo(req.GetParentInfoJson())
+	parent, err := runtime.ParentInfoFromRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +217,7 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	// Without it the DatabaseUser lands on the DEFAULT mongodbatlas provider, which
 	// has no credentials: the deploy fails at create with an Atlas 401, and a stack
 	// migrating from the in-tree processor would see its provider replaced.
-	provider, err := p.computeProvider(pctx, stack, req, cfg, parent)
+	provider, err := p.computeProvider(rctx.Pulumi, stack, req, cfg, parent)
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
@@ -277,7 +228,7 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	// sidecar then applies our env_vars + tpl_extensions back into the
 	// live core-side collector.
 	collector := newCapturingCollector()
-	_, err = mongoInternal.ClusterComputeProcessor(pctx, stack, input, collector, pApi.ProvisionParams{
+	_, err = mongoInternal.ClusterComputeProcessor(rctx.Pulumi, stack, input, collector, pApi.ProvisionParams{
 		Log:         logger.New(),
 		ParentStack: parent,
 		Provider:    provider,
@@ -288,24 +239,15 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	}
 	// Every MONGO_* variable is added inside an ApplyT on the database user
 	// (AddOutput). Answer before those have resolved and the response carries no
-	// env at all — and the deferred pctx.Close() then cuts the user's in-flight
+	// env at all — and the deferred Settle teardown then cuts the user's in-flight
 	// RegisterResource. Waiting here is what in-tree SC did by blocking the
 	// consumer's provisioning on collector.Outputs().
 	if err := collector.AwaitOutputs(ctx); err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
 	}
-	// AwaitOutputs blocks until each ApplyT resolves, but the DatabaseUser
-	// + RandomPassword RegisterResource RPCs ride a separate goroutine
-	// path that AwaitOutputs doesn't touch. Drain those too, same reason
-	// as Provider/Provision above (see drain.go). The 2026-10-31 incident
-	// hit both call sites; both get the drain.
-	if derr := drainContext(pctx); derr != nil {
-		p.progress.Error("compute-process", "drain: "+derr.Error())
-		return nil, derr
-	}
 
-	resp := collector.ToResponse()
+	resp = collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
 }
@@ -338,10 +280,14 @@ func (p *mongoPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv
 
 // Helpers below — all shape-matching glue.
 
-// decodeInputsAs lifts the plugin bus's input map into a typed struct
-// via YAML round-trip. Same pattern sc-plugin-cloudru + sc-plugin-yandex
-// use. AtlasConfig's scalar JSON fallback preserves structured settings even
-// with SC cores that transmit only scalar InputValues.
+// decodeInputsAs lifts the plugin bus's input map into a typed struct. For
+// AtlasConfig the plugin's api package emits an `atlasConfigJson` scalar
+// fallback alongside the structured bus fields, because older SC cores
+// serialised only scalars onto the plugin bus (nested maps and lists were
+// dropped). This function prefers the complete JSON payload when present,
+// then falls back to a yaml round-trip through api/pkg/plugin.InputsToPlain
+// via runtime.DecodeInputs — which handles nested maps and lists correctly
+// (unlike the scalar-only unwrap this file used to carry inline).
 func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
 	// AtlasConfig emits a scalar JSON fallback because older SC cores omit
 	// maps/lists from the bus. Prefer the complete payload when available.
@@ -355,19 +301,12 @@ func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) err
 		}
 		return nil
 	}
-	plain := make(map[string]any, len(inputs))
-	for k, v := range inputs {
-		switch x := v.GetValue().(type) {
-		case *scpluginv1.InputValue_StringValue:
-			plain[k] = x.StringValue
-		case *scpluginv1.InputValue_BoolValue:
-			plain[k] = x.BoolValue
-		case *scpluginv1.InputValue_DoubleValue:
-			plain[k] = x.DoubleValue
-		case *scpluginv1.InputValue_BytesValue:
-			plain[k] = string(x.BytesValue)
-		}
-	}
+	// Fall back to the structured bus fields via a yaml round-trip through
+	// scPlugin.InputsToPlain, which preserves nested maps and lists.
+	// `runtime.DecodeInputs` wraps that round-trip; we inline the shape
+	// here only because the config_transport_test's scalar-only path exercises
+	// a yaml.v3 edge case AtlasConfig's own fallback test fixtures target.
+	plain := scPlugin.InputsToPlain(inputs)
 	b, err := yaml.Marshal(plain)
 	if err != nil {
 		return err
@@ -405,26 +344,11 @@ func resourceInputFromProvision(req *scpluginv1.ProvisionRequest, cfg *mongoApi.
 	}
 }
 
-// resourceInputFromComputeProcess mirrors the in-tree processResourceDependency: the
-// resource lives in the PARENT's env (params.CopyForParentEnv(resEnv)), not the consuming
-// stack's env from the request header — e.g. a staging-ru client using the parent's
-// staging cluster must look up "<parent>--mongodb--staging-id", not "...--staging-ru-id".
+// resourceInputFromComputeProcess delegates to runtime.ResourceInputForComputeProcess
+// — a thin wrapper so parent_info_test.go keeps using mongodb's own test API,
+// and the AtlasConfig cfg is attached in the local shape before handing off.
 func resourceInputFromComputeProcess(req *scpluginv1.ComputeProcessRequest, cfg *mongoApi.AtlasConfig, parent *pApi.ParentInfo) api.ResourceInput {
-	env := req.GetHeader().GetEnvironment()
-	if parent != nil && parent.ParentEnv != "" {
-		env = parent.ParentEnv
-	}
-	return api.ResourceInput{
-		Descriptor: &api.ResourceDescriptor{
-			Type:   req.GetResourceType(),
-			Name:   req.GetResourceName(),
-			Config: api.Config{Config: cfg},
-		},
-		StackParams: &api.StackParams{
-			StackName:   req.GetHeader().GetStackName(),
-			Environment: env,
-		},
-	}
+	return runtime.ResourceInputForComputeProcess(req, parent, cfg)
 }
 
 // computeProvider builds the Atlas provider the compute processor's resources use.
@@ -456,20 +380,12 @@ func (p *mongoPlugin) computeProvider(pctx *sdk.Context, stack api.Stack, req *s
 }
 
 // waitForRef blocks until a Pulumi Output in a resource ref resolves —
-// same reason + same shape as sc-plugin-cloudflare/yandex/cloudru.
-//
-// IMPORTANT: an unhandled `ref` type falls into `default` which Sprintf's
-// the pointer without awaiting ANY URN. That is NOT just a cosmetic
-// miss — Pulumi SDK schedules RegisterResource on a goroutine triggered
-// by the first consumer of the Resource's URN output; if nothing ever
-// consumes it in-handler, the register goroutine may never fire its
-// gRPC call to the monitor. drainContext() only drains RPCs that have
-// *started*; if the SDK is still waiting for the URN-output consumer
-// to kick things off, drain sees `rpcs == 0` and returns immediately.
-// We saw this live post-cascade on 2026-10-31: the Cluster URN was
-// built, the handler returned "cluster registered", drain returned,
-// and the Pulumi monitor never got a RegisterResource call for the
-// Cluster. ALWAYS add a case here for a new ref type.
+// Settle drains pending RegisterResource goroutines before the RPC
+// response, but each handler still needs a concrete string for the Urn
+// field of its response, and this is how we pluck one out of a resource
+// ref. ALWAYS add a case here for a new ref type — see
+// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+// Addendum V for the race the default-case fallthrough would reintroduce.
 func waitForRef(ref any) string {
 	if ref == nil {
 		return ""
@@ -478,28 +394,23 @@ func waitForRef(ref any) string {
 	case string:
 		return r
 	case *mongoInternal.ClusterOutput:
-		// The Provision handler returns a *ClusterOutput wrapping the Cluster
-		// + Project + optional PrivateLink. Awaiting EACH non-nil resource's
-		// URN forces the register goroutine to actually dispatch the gRPC
-		// RegisterResource — same pattern as sc-plugin-cloudflare/await.go.
-		// Return the Cluster URN as the primary ref (it is what SC core
-		// records in the sidecar's state).
-		ctx := context.Background()
-		if r.Project != nil {
-			_, _ = internals.UnsafeAwaitOutput(ctx, r.Project.URN())
+		// mongoInternal.Cluster returns this concrete type as its Ref.
+		// Await the underlying Cluster resource's URN rather than falling
+		// through to the default Sprintf which produces the pointer
+		// representation. r.Cluster is nil during an adopt-only path
+		// (AdoptCluster builds a ClusterOutput without a *Cluster).
+		if r.Cluster == nil {
+			return ""
 		}
-		if r.PrivateLinkEndpointService != nil {
-			_, _ = internals.UnsafeAwaitOutput(ctx, r.PrivateLinkEndpointService.URN())
-		}
-		if r.Cluster != nil {
-			out, err := internals.UnsafeAwaitOutput(ctx, r.Cluster.URN())
-			if err == nil {
-				if urn, ok := out.Value.(sdk.URN); ok {
-					return string(urn)
-				}
+		ch := make(chan string, 1)
+		r.Cluster.URN().ApplyT(func(u sdk.URN) sdk.URN {
+			select {
+			case ch <- string(u):
+			default:
 			}
-		}
-		return ""
+			return u
+		})
+		return <-ch
 	case sdk.ProviderResource:
 		ch := make(chan string, 1)
 		r.URN().ApplyT(func(u sdk.URN) sdk.URN {
@@ -551,128 +462,11 @@ func main() {
 		// emitted on a plugin crash — observed empirically on forge run
 		// 41191832415 (2026-10-31) where the panic header appeared at
 		// Debug but goroutine stacks were truncated by the parent's
-		// own filter. See sc-plugin-aws main.go for the same shape.
+		// own filter.
 		Logger: hclog.New(&hclog.LoggerOptions{
 			Name:   "sc-plugin-mongodb",
 			Level:  hclog.Debug,
 			Output: os.Stderr,
 		}),
 	})
-}
-
-// decodeParentInfo reads ComputeProcessRequest.parent_info_json. Core writes it with
-// json.Marshal on an untagged struct, so the keys are the Go field names ("StackName",
-// "FullReference", …). It must be decoded as JSON: yaml.v3 matches untagged fields by
-// their lowercased names and leaves every field empty, which broke every `uses:` of a
-// mongodb-atlas resource (an empty parent StackReference).
-func decodeParentInfo(raw []byte) (*pApi.ParentInfo, error) {
-	parent := &pApi.ParentInfo{}
-	if len(raw) == 0 {
-		return parent, nil
-	}
-	if err := json.Unmarshal(raw, parent); err != nil {
-		return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
-	}
-	return parent, nil
-}
-
-// harvestPctxExports reads every `pctx.Export(k, v)` call made during the
-// RPC handler and converts each value into an InputValue the wire can carry.
-// Awaits every sdk.Output so a late-resolving ApplyT chain (e.g.
-// Cluster.MongoUri, which only resolves after the register goroutine
-// completes) still gets its concrete string into the response.
-//
-// SC core re-exports whatever this returns onto its OWN pctx — that is what
-// lands the keys in the parent stack root's `RegisterResourceOutputs`.
-// Without this, the plugin's exports stay in the plugin and the parent root
-// has no plugin keys (live-caught 2026-10-31 after the mongodb cascade adopt;
-// see Addendum U of 04-no-destroy-invariant.md).
-func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scpluginv1.InputValue, error) {
-	raw := pctx.GetCurrentExportMap()
-	out := make(map[string]*scpluginv1.InputValue, len(raw))
-	for k, v := range raw {
-		plain, secret, err := awaitInputToPlain(ctx, v)
-		if err != nil {
-			return out, errors.Wrapf(err, "await export %q", k)
-		}
-		if iv := anyToInputValue(plain); iv != nil {
-			iv.Secret = secret
-			out[k] = iv
-		}
-	}
-	return out, nil
-}
-
-// awaitInputToPlain returns (concrete value, secret flag, error). The
-// Secret flag MUST be preserved: SC core wraps the re-export with
-// sdk.ToSecret when this bool is true, so a secret-marked output
-// doesn't land plaintext in the parent stack root. mongodb's exports
-// today are not secret-flagged (Mongo URIs are credential-free by
-// design in Cluster()), but the same wire shape ships for every plugin
-// and losing the flag would be a plaintext leak for anything that is.
-// Live-caught 2026-10-31 against the aws harvest; see Addendum V of
-// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md.
-func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, bool, error) {
-	if v == nil {
-		return nil, false, nil
-	}
-	// Easy cases first — Pulumi's primitive Input wrappers resolve inline.
-	switch tv := v.(type) {
-	case sdk.String:
-		return string(tv), false, nil
-	case sdk.Bool:
-		return bool(tv), false, nil
-	case sdk.Int:
-		return int(tv), false, nil
-	case sdk.Float64:
-		return float64(tv), false, nil
-	}
-	// Pulumi's Output types all implement sdk.Output; await their value.
-	if out, ok := v.(sdk.Output); ok {
-		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
-		if aerr != nil {
-			return nil, false, aerr
-		}
-		return unwrapPlain(resolved.Value), resolved.Secret, nil
-	}
-	return nil, false, nil
-}
-
-func unwrapPlain(v any) any {
-	// Common Pulumi concrete values are plain Go types; nothing to do.
-	switch tv := v.(type) {
-	case sdk.URN:
-		return string(tv)
-	case sdk.ID:
-		return string(tv)
-	}
-	return v
-}
-
-// anyToInputValue is a thin mirror of api/pkg/clouds/pulumi.toInputValue —
-// kept local because that helper is unexported and this plugin only needs
-// the scalar branches today. Returns nil for a nil value (SC core treats
-// the absent key as a no-op, matching api/pkg/plugin.InputValueToPlain).
-func anyToInputValue(v any) *scpluginv1.InputValue {
-	if v == nil {
-		return nil
-	}
-	switch sv := v.(type) {
-	case string:
-		if sv == "" {
-			return nil
-		}
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: sv}}
-	case bool:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BoolValue{BoolValue: sv}}
-	case int:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: int64(sv)}}
-	case int64:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: sv}}
-	case float64:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_DoubleValue{DoubleValue: sv}}
-	case []byte:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BytesValue{BytesValue: sv}}
-	}
-	return nil
 }

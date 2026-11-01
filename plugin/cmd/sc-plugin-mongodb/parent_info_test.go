@@ -6,6 +6,7 @@ import (
 
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	mongoApi "github.com/simple-container-com/sc-plugin-mongodb/api"
 )
@@ -22,7 +23,7 @@ func TestDecodeParentInfoRoundTripsCoreJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := decodeParentInfo(raw)
+	got, err := runtime.ParentInfoFromRequest(&scpluginv1.ComputeProcessRequest{ParentInfoJson: raw})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,9 +34,14 @@ func TestDecodeParentInfoRoundTripsCoreJSON(t *testing.T) {
 }
 
 func TestDecodeParentInfoEmpty(t *testing.T) {
-	got, err := decodeParentInfo(nil)
-	if err != nil || got == nil || got.StackName != "" {
-		t.Fatalf("empty input: got %+v, err %v", got, err)
+	got, err := runtime.ParentInfoFromRequest(&scpluginv1.ComputeProcessRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty parent info returns a nil pointer, matching the runtime library's
+	// "no parent on this RPC" semantics.
+	if got != nil {
+		t.Fatalf("empty input: got %+v, want nil", got)
 	}
 }
 
