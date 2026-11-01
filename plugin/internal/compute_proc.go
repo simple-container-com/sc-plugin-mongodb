@@ -10,7 +10,6 @@ import (
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	"github.com/simple-container-com/api/pkg/util"
@@ -109,8 +108,23 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 // used by SC 2025.12.6 (which ignored custom cluster names and naming versions).
 // Only an absent output permits fallback: a malformed or empty value must not
 // silently select another cluster when both names exist in the parent.
+//
+// When the parent's AtlasConfig declares `clusterName:` (an operator-managed
+// custom name — typical for `adopt: true`), parent exports are keyed on that
+// name verbatim (see cluster.go / adopt_cluster.go for the Pulumi-URN-stable
+// split). Try it FIRST — the `toClusterName(..., 21-budget)` and
+// `toClusterNameV1` variants are the legacy auto-generated prefixes and now
+// serve as back-compat fallbacks.
 func parentMongoURI(ref *sdk.StackReference, stackName string, input api.ResourceInput, parentRef string) (string, string, error) {
-	clusterNames := lo.Uniq([]string{toClusterName(stackName, input), toClusterNameV1(stackName, input)})
+	var atlasCfg *mongodb.AtlasConfig
+	if cfg, ok := input.Descriptor.Config.Config.(*mongodb.AtlasConfig); ok {
+		atlasCfg = cfg
+	}
+	candidates := []string{toClusterName(stackName, input), toClusterNameV1(stackName, input)}
+	if atlasCfg != nil && atlasCfg.ClusterName != "" {
+		candidates = append([]string{atlasCfg.ClusterName}, candidates...)
+	}
+	clusterNames := lo.Uniq(candidates)
 	exportNames := make([]string, 0, len(clusterNames))
 	for _, clusterName := range clusterNames {
 		exportName := toMongoUriWithOptionsExport(clusterName)
