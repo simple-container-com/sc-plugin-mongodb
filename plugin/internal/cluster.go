@@ -287,8 +287,10 @@ func toClusterName(stackName string, input api.ResourceInput) string {
 		return util.TrimStringMiddle(atlasCfg.ClusterName, 21, "--")
 	}
 
-	// Determine naming strategy version (default is 2 for new logic)
-	namingVersion := 2
+	// SC 2025.12.6 always used v1, including when the config omitted a
+	// naming version. Preserve both Pulumi identities and Atlas names on
+	// upgrade; hash-based naming must be an explicit opt-in for new stacks.
+	namingVersion := 1
 	if atlasCfg != nil && atlasCfg.NamingStrategyVersion != nil {
 		namingVersion = *atlasCfg.NamingStrategyVersion
 	}
@@ -301,8 +303,8 @@ func toClusterName(stackName string, input api.ResourceInput) string {
 		// Version 2: Improved hash-based logic (for new clusters)
 		return toClusterNameV2(stackName, input)
 	default:
-		// Fallback to version 2 for any unknown versions
-		return toClusterNameV2(stackName, input)
+		// Unknown versions must not silently rename existing resources.
+		return toClusterNameV1(stackName, input)
 	}
 }
 

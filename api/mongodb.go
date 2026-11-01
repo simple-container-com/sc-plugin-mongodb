@@ -40,7 +40,7 @@ type AtlasConfig struct {
 	// Deletion protection
 	DeletionProtection bool `json:"deletionProtection,omitempty" yaml:"deletionProtection,omitempty"`
 	// Naming strategy version control
-	NamingStrategyVersion *int `json:"namingStrategyVersion,omitempty" yaml:"namingStrategyVersion,omitempty"` // Default 2 (new), use 1 for legacy
+	NamingStrategyVersion *int `json:"namingStrategyVersion,omitempty" yaml:"namingStrategyVersion,omitempty"` // Default 1 (legacy); 2 explicitly opts into hash-based names
 }
 
 // MarshalJSON preserves structured Atlas settings through older SC plugin

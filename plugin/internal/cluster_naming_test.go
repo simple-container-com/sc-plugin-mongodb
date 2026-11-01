@@ -87,7 +87,7 @@ func TestToClusterName_NamingStrategyVersions(t *testing.T) {
 		name         string
 		stackName    string
 		resourceName string
-		version      *int // nil = default (2), 1 = legacy, 2 = new
+		version      *int // nil = default (1), 1 = legacy, 2 = opt-in
 		expected     string
 		description  string
 	}{
@@ -127,9 +127,9 @@ func TestToClusterName_NamingStrategyVersions(t *testing.T) {
 			name:         "default version (no version specified)",
 			stackName:    "integrail",
 			resourceName: "mongodb-pool-dedicated-2",
-			version:      nil,                       // Should default to version 2
-			expected:     "integrail--mongodb-3b28", // Version 2 hash-based behavior
-			description:  "Default behavior uses version 2 naming strategy",
+			version:      nil,
+			expected:     "integrail---ed-2--test",
+			description:  "Omitted version preserves names from SC 2025.12.6",
 		},
 		{
 			name:         "version 2 - conflict resolution",
@@ -160,7 +160,7 @@ func TestToClusterName_NamingStrategyVersions(t *testing.T) {
 			}
 
 			t.Logf("Version %v: %s -> %s (len=%d)",
-				ptrIntValue(tt.version, 2), tt.resourceName, result, len(result))
+				ptrIntValue(tt.version, 1), tt.resourceName, result, len(result))
 		})
 	}
 }
@@ -195,8 +195,8 @@ func TestToClusterName_WithCustomClusterName(t *testing.T) {
 			stackName:         "integrail",
 			resourceName:      "mongodb-pool-dedicated-1",
 			customClusterName: "",
-			expected:          "integrail--mongodb-3b05", // Falls back to improved default
-			description:       "Empty custom name uses improved default logic",
+			expected:          "integrail---ed-1--test", // Falls back to legacy default
+			description:       "Empty custom name preserves legacy naming",
 		},
 	}
 
