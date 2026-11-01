@@ -23,6 +23,26 @@ unless an operator pins a specific version via `plugins.mongodb.source.version`.
   deploying stack's client descriptor and drops per-service databases
   enumerated from stack outputs.
 
+## Atlas resource names
+
+Omitting `namingStrategyVersion` preserves SC 2025.12.6's built-in provider
+names. The project name is `<stack>--<resource>--<env>` (using `parentEnv` when
+present). Cluster names use `TrimStringMiddle(projectName, 21, "--")`: names
+longer than 21 characters become the first 10 characters, `--`, and the last
+10 characters. Keep the resulting hyphens exactly as generated. For example,
+`alphamind-co--mongodb--prod` becomes `alphamind---godb--prod`.
+
+Pulumi logical names append `-cluster`, `-<username>-user`, `-ip-access-list`,
+or `-backups-schedule` to that cluster name. The Atlas cluster name uses the
+same prefix; database usernames remain the configured usernames.
+
+Hash-based naming is available with an explicit `namingStrategyVersion: 2`
+for new stacks. Stacks already provisioned with the plugin's former hash-based
+default must set `namingStrategyVersion: 2` to retain those names. Changing
+the version on an existing stack changes resource identities and can cause
+deletion and recreation. Explicit custom cluster names retain their existing
+behavior. Consumers can still read legacy, hash-based, and custom parent exports.
+
 ## Deferred (follow-up)
 
 - **PrivateLink** + AWS VPC endpoint + MongoDB private link endpoint

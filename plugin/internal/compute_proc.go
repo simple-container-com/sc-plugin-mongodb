@@ -104,8 +104,9 @@ func ClusterComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Resour
 	}, nil
 }
 
-// parentMongoURI prefers the configured name, then tries exactly the naming
-// used by SC 2025.12.6 (which ignored custom cluster names and naming versions).
+// parentMongoURI prefers the configured name, then tries the naming used by
+// SC 2025.12.6 and the former hash-based default. This also supports parents
+// provisioned by the plugin before legacy naming became the default again.
 // Only an absent output permits fallback: a malformed or empty value must not
 // silently select another cluster when both names exist in the parent.
 //
@@ -120,7 +121,7 @@ func parentMongoURI(ref *sdk.StackReference, stackName string, input api.Resourc
 	if cfg, ok := input.Descriptor.Config.Config.(*mongodb.AtlasConfig); ok {
 		atlasCfg = cfg
 	}
-	candidates := []string{toClusterName(stackName, input), toClusterNameV1(stackName, input)}
+	candidates := []string{toClusterName(stackName, input), toClusterNameV1(stackName, input), toClusterNameV2(stackName, input)}
 	if atlasCfg != nil && atlasCfg.ClusterName != "" {
 		candidates = append([]string{atlasCfg.ClusterName}, candidates...)
 	}

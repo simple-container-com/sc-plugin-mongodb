@@ -66,13 +66,15 @@ func TestClusterComputeProcessorParentOutputs(t *testing.T) {
 		{name: "explicit v1 parent", version: lo.ToPtr(1), outputs: resource.PropertyMap{legacyExport: plain(legacyURI)}, wantHost: "legacy.example.net", wantCluster: "alphamind---godb--prod"},
 		{name: "modern parent", outputs: resource.PropertyMap{modernExport: plain(modernURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
 		{name: "modern secret URI and project", secretProject: true, outputs: resource.PropertyMap{modernExport: secret(modernURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
-		{name: "prefer configured name", outputs: resource.PropertyMap{modernExport: plain(modernURI), legacyExport: plain(legacyURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
-		{name: "prefer configured secret over legacy plain", outputs: resource.PropertyMap{modernExport: secret(modernURI), legacyExport: plain(legacyURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
+		{name: "prefer configured name", version: lo.ToPtr(2), outputs: resource.PropertyMap{modernExport: plain(modernURI), legacyExport: plain(legacyURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
+		{name: "prefer configured secret over legacy plain", version: lo.ToPtr(2), outputs: resource.PropertyMap{modernExport: secret(modernURI), legacyExport: plain(legacyURI)}, wantHost: "modern.example.net", wantCluster: "alphamind-co--mong-8d9f"},
+		{name: "default prefers legacy when both exist", outputs: resource.PropertyMap{modernExport: plain(modernURI), legacyExport: plain(legacyURI)}, wantHost: "legacy.example.net", wantCluster: "alphamind---godb--prod"},
+		{name: "invalid default legacy URI does not select modern", outputs: resource.PropertyMap{modernExport: plain(modernURI), legacyExport: resource.NewNumberProperty(42)}, wantErr: "not string"},
 		{name: "custom parent", customName: "custom-cluster", outputs: resource.PropertyMap{"custom-cluster-mongo-uri-options": plain(modernURI)}, wantHost: "modern.example.net", wantCluster: "custom-cluster"},
 		{name: "missing URI", outputs: resource.PropertyMap{}, wantErr: legacyExport},
-		{name: "empty URI does not select another cluster", outputs: resource.PropertyMap{modernExport: plain(""), legacyExport: plain(legacyURI)}, wantErr: "mongo uri is empty"},
-		{name: "malformed URI does not select another cluster", outputs: resource.PropertyMap{modernExport: resource.NewNumberProperty(42), legacyExport: plain(legacyURI)}, wantErr: "not string"},
-		{name: "undecryptable URI does not select another cluster", outputs: resource.PropertyMap{modernExport: resource.NewObjectProperty(resource.PropertyMap{"ciphertext": plain("sensitive-placeholder")}), legacyExport: plain(legacyURI)}, wantErr: "not string"},
+		{name: "empty URI does not select another cluster", version: lo.ToPtr(2), outputs: resource.PropertyMap{modernExport: plain(""), legacyExport: plain(legacyURI)}, wantErr: "mongo uri is empty"},
+		{name: "malformed URI does not select another cluster", version: lo.ToPtr(2), outputs: resource.PropertyMap{modernExport: resource.NewNumberProperty(42), legacyExport: plain(legacyURI)}, wantErr: "not string"},
+		{name: "undecryptable URI does not select another cluster", version: lo.ToPtr(2), outputs: resource.PropertyMap{modernExport: resource.NewObjectProperty(resource.PropertyMap{"ciphertext": plain("sensitive-placeholder")}), legacyExport: plain(legacyURI)}, wantErr: "not string"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			outputs := tc.outputs.Copy()
