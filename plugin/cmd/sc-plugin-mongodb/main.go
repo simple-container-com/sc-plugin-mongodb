@@ -223,31 +223,28 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 		return nil, err
 	}
 
-	// ClusterComputeProcessor returns an api.ResourceOutput and mutates
-	// the collector. Our sidecar wrapper is the collector — the SC-core
-	// sidecar then applies our env_vars + tpl_extensions back into the
-	// live core-side collector.
-	collector := newCapturingCollector()
-	_, err = mongoInternal.ClusterComputeProcessor(rctx.Pulumi, stack, input, collector, pApi.ProvisionParams{
+	// Every MONGO_* variable is added inside an ApplyT on the database user
+	// (AddOutput). runtime.RunComputeProcess captures those outputs via the
+	// shared Collector and awaits them BEFORE marshalling, so the response
+	// carries the env regardless of whether the processor builds env
+	// synchronously or from inside an ApplyT. Answer before those have
+	// resolved and the deferred Settle teardown cuts the user's in-flight
+	// RegisterResource — which is exactly what the pre-port call-site did
+	// by hand (collector.AwaitOutputs). Hoisting the drain into
+	// RunComputeProcess is what closes trap 16 (sc-plugin-aws S3 processor
+	// live-caught on agent-native-pdf-rendering run f4355798, 2026-11-02);
+	// mongodb was the one plugin that got the drain right in the first
+	// place — the structural change here just makes it mandatory by
+	// construction so no future plugin forgets.
+	resp, _, err = runtime.RunComputeProcess(ctx, rctx, stack, input, pApi.ProvisionParams{
 		Log:         logger.New(),
 		ParentStack: parent,
 		Provider:    provider,
-	})
+	}, mongoInternal.ClusterComputeProcessor)
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
 	}
-	// Every MONGO_* variable is added inside an ApplyT on the database user
-	// (AddOutput). Answer before those have resolved and the response carries no
-	// env at all — and the deferred Settle teardown then cuts the user's in-flight
-	// RegisterResource. Waiting here is what in-tree SC did by blocking the
-	// consumer's provisioning on collector.Outputs().
-	if err := collector.AwaitOutputs(ctx); err != nil {
-		p.progress.Error("compute-process", err.Error())
-		return nil, err
-	}
-
-	resp = collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
 }
