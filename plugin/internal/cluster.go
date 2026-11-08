@@ -248,6 +248,8 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 		return createDatabaseUsers(ctx, cluster, atlasCfg, params)
 	})
 	ctx.Export(fmt.Sprintf("%s-users", projectName), usersOutput)
+	// The map export above never survives core's harvest; these scalars do.
+	exportDbUserCredentials(ctx, projectName, atlasCfg, usersOutput)
 
 	out.DbUsers = usersOutput
 
@@ -268,6 +270,90 @@ func toClusterIdExport(clusterName string) string {
 
 func toProjectIdExport(projectName string) string {
 	return fmt.Sprintf("%s-id", projectName)
+}
+
+// toDbUserExport is the per-user credential export key. `-db-user` rather than
+// `-user`, so it cannot collide with the compute processor's
+// `<cluster><suffix>-service-user` keys or with the DatabaseUser resource names.
+func toDbUserExport(projectName, username string) string {
+	return fmt.Sprintf("%s-%s-db-user", projectName, username)
+}
+
+// exportDbUserCredentials publishes one SCALAR export per configured admin and
+// developer, carrying that user's {userName,password,dbUri} JSON.
+//
+// The `<projectName>-users` export next to it looks like it already does this
+// and does not: its value is a MAP, and SC core's harvest
+// (api/pkg/plugin/runtime/harvest.go:anyToInputValue) carries only string,
+// bool, int, int64, float64 and []byte — anything else converts to nil and
+// HarvestExports then drops the key entirely, with no warning. So every
+// operator password the plugin generates has been invisible to
+// `sc stack outputs` on both the create and the adopt path, for as long as
+// both have existed. Live-caught on forge infra 2026-11-08, where an adopted
+// cluster's `admins: [vitaly, smecsia]` / `developers: [backup]` produced
+// users in Atlas and four scalar keys in the stack, none of them a credential.
+//
+// One key per user instead of fixing the harvest to flatten maps: a map-aware
+// harvest would start publishing every plugin's map exports at once, and
+// nothing in this plugin marks anything secret, so the first thing it would
+// publish is these passwords in plaintext.
+//
+// Hence sdk.ToSecret here. The per-value secret flag survives the harvest and
+// is re-applied when core re-exports onto the stack root
+// (api plugin_sidecars.go), so the checkpoint stores these encrypted;
+// `sc stack outputs` still renders them, which is the point.
+//
+// The usernames come from config and are known before the apply, so each
+// export is registered at the top level of the RunFunc — not inside the apply
+// that creates the users. An export registered inside an apply races the
+// RunFunc's return and can be dropped (the failure mode sc-plugin-cloudflare#2
+// fixed for resource registrations).
+func exportDbUserCredentials(ctx *sdk.Context, projectName string, cfg *mongodb.AtlasConfig, usersOutput sdk.Output) {
+	usernames := make([]string, 0, len(cfg.Admins)+len(cfg.Developers))
+	usernames = append(usernames, cfg.Admins...)
+	usernames = append(usernames, cfg.Developers...)
+
+	for _, username := range usernames {
+		user := username
+		ctx.Export(toDbUserExport(projectName, user), sdk.ToSecret(
+			usersOutput.ApplyT(func(resolved any) (string, error) {
+				return dbUserFromUsersOutput(resolved, user)
+			})))
+	}
+}
+
+// dbUserFromUsersOutput picks one user's JSON out of whatever
+// createDatabaseUsers resolved to.
+//
+// The two call paths nest differently — the create path wraps
+// createDatabaseUsers in another sdk.All().ApplyT(), the adopt path calls it
+// directly — and ApplyT unwraps a returned Output one level per hop, so both
+// arrive here as a resolved map. The map's value type is not pinned by
+// anything, hence both shapes.
+//
+// An unexpected shape is an error, not an empty string: a credential export
+// that silently resolves to "" reads exactly like a user whose password is
+// blank.
+func dbUserFromUsersOutput(resolved any, username string) (string, error) {
+	switch m := resolved.(type) {
+	case map[string]any:
+		s, ok := m[username].(string)
+		if !ok {
+			return "", errors.Errorf("mongodb user %q is absent from the users output (has %v)",
+				username, lo.Keys(m))
+		}
+		return s, nil
+	case map[string]string:
+		s, ok := m[username]
+		if !ok {
+			return "", errors.Errorf("mongodb user %q is absent from the users output (has %v)",
+				username, lo.Keys(m))
+		}
+		return s, nil
+	default:
+		return "", errors.Errorf("mongodb users output is %T, not a map: cannot read user %q",
+			resolved, username)
+	}
 }
 
 func toProjectName(stackName string, input api.ResourceInput) string {
