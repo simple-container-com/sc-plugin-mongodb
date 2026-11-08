@@ -168,6 +168,11 @@ func AdoptCluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 		usersOutput = users
 	}
 	ctx.Export(fmt.Sprintf("%s-users", projectName), usersOutput)
+	// Same per-user scalar exports as the provisioning path — the map export
+	// above is dropped by core's harvest, so without these an adopted
+	// cluster's operator credentials are unreachable. No-op when neither
+	// `admins` nor `developers` is configured.
+	exportDbUserCredentials(ctx, projectName, atlasCfg, usersOutput)
 
 	out := &ClusterOutput{
 		DbUsers:                    usersOutput,
