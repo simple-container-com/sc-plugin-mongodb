@@ -150,9 +150,23 @@ func AdoptCluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 	ctx.Export(toMongoUriExport(exportClusterName), cluster.MongoUri)
 	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), cluster.MongoUriWithOptions)
 
-	// For adopted clusters, we don't create database users here - that's handled by the compute processor
-	// Export empty users list to maintain compatibility
+	// Per-service users are the compute processor's job; the cluster-wide
+	// `admins` (readWriteAnyDatabase) and `developers` (readAnyDatabase) are
+	// this function's, exactly as on the provisioning path. Adoption used to
+	// skip them, which silently dropped every operator user the day a stack
+	// switched to `adopt: true` — live-caught on forge `infra` after the
+	// 2026-10-31 project cascade was restored through adoption: the
+	// `-vitaly-user`/`-smecsia-user` DatabaseUsers left state and `admins`
+	// became a no-op. With no admins/developers configured the export stays
+	// the empty list it always was, so stacks that set neither see no diff.
 	usersOutput := sdk.ToOutput([]interface{}{})
+	if len(atlasCfg.Admins)+len(atlasCfg.Developers) > 0 {
+		users, ok := createDatabaseUsers(ctx, cluster, atlasCfg, params).(sdk.Output)
+		if !ok {
+			return nil, errors.Errorf("failed to create database users for adopted cluster %q", atlasCfg.ClusterName)
+		}
+		usersOutput = users
+	}
 	ctx.Export(fmt.Sprintf("%s-users", projectName), usersOutput)
 
 	out := &ClusterOutput{
