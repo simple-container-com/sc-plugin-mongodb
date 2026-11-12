@@ -238,11 +238,20 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 
 	ctx.Export(toClusterIdExport(exportClusterName), cluster.ClusterId)
 
-	ctx.Export(toMongoUriExport(exportClusterName), cluster.MongoUri)
+	// mongo-uri + mongo-uri-with-options carry the cluster-admin user's
+	// password embedded in the connection string (`mongodb+srv://user:pass@…`).
+	// Wrap in sdk.ToSecret() so Pulumi state encrypts them + `sc stack
+	// outputs` masks them + cross-stack consumers via PluginResourceOutput
+	// see `secret: true`. Before 2026-11-12 these exports were plaintext and
+	// the password leaked in every operator's `sc stack outputs` log; see
+	// forge roadmap item sc-plugin-mongodb-uri-plaintext-export + the
+	// generic trap memory `interface_assertion_against_plugin_owned_value_fails_in_prod`
+	// (sibling class).
+	ctx.Export(toMongoUriExport(exportClusterName), sdk.ToSecret(cluster.MongoUri))
 	// mongodb v1 has no PrivateLink path (above refusal), so the standard
 	// MongoUriWithOptions is always what consumers want. The PrivateLink
 	// follow-up re-adds the LookupCluster branch here.
-	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), cluster.MongoUriWithOptions)
+	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), sdk.ToSecret(cluster.MongoUriWithOptions))
 
 	usersOutput := sdk.All(projectId).ApplyT(func(args []any) any {
 		return createDatabaseUsers(ctx, cluster, atlasCfg, params)
@@ -318,7 +327,8 @@ func exportDbUserCredentials(ctx *sdk.Context, projectName string, cfg *mongodb.
 		ctx.Export(toDbUserExport(projectName, user), sdk.ToSecret(
 			usersOutput.ApplyT(func(resolved any) (string, error) {
 				return dbUserFromUsersOutput(resolved, user)
-			})))
+			}),
+		))
 	}
 }
 
