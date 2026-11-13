@@ -150,6 +150,14 @@ func AdoptCluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 	ctx.Export(toMongoUriExport(exportClusterName), cluster.MongoUri)
 	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), cluster.MongoUriWithOptions)
 
+	// Slice 1d.3 of sc-components-platform — mirror the provisioning
+	// path's per-cluster `-database` export. Operator-declared opt-in;
+	// sibling matchers (sc-component-backup's MatchConsumerToDatabase)
+	// read it via the `-database` suffix.
+	if atlasCfg.Database != "" {
+		ctx.Export(toDatabaseExport(exportClusterName), sdk.String(atlasCfg.Database))
+	}
+
 	// Per-service users are the compute processor's job; the cluster-wide
 	// `admins` (readWriteAnyDatabase) and `developers` (readAnyDatabase) are
 	// this function's, exactly as on the provisioning path. Adoption used to

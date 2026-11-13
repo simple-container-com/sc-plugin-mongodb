@@ -253,6 +253,16 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 	// follow-up re-adds the LookupCluster branch here.
 	ctx.Export(toMongoUriWithOptionsExport(exportClusterName), sdk.ToSecret(cluster.MongoUriWithOptions))
 
+	// Slice 1d.3 of sc-components-platform: per-cluster primary database
+	// name. When the operator declares `config.database:`, sibling resources
+	// (sc-component-backup's MatchConsumerToDatabase matcher via the
+	// `-database` suffix) resolve the backup target without duplicating
+	// the DB name in their own config. Legacy stacks that pre-date the
+	// field skip the export entirely — no empty-string key published.
+	if atlasCfg.Database != "" {
+		ctx.Export(toDatabaseExport(exportClusterName), sdk.String(atlasCfg.Database))
+	}
+
 	usersOutput := sdk.All(projectId).ApplyT(func(args []any) any {
 		return createDatabaseUsers(ctx, cluster, atlasCfg, params)
 	})
@@ -275,6 +285,13 @@ func toMongoUriWithOptionsExport(clusterName string) string {
 
 func toClusterIdExport(clusterName string) string {
 	return fmt.Sprintf("%s-cluster-id", clusterName)
+}
+
+// toDatabaseExport is the per-cluster primary database export key. Opt-in
+// via `AtlasConfig.Database`; sibling matchers (sc-component-backup's
+// `MatchConsumerToDatabase`) read it via the `-database` suffix.
+func toDatabaseExport(clusterName string) string {
+	return fmt.Sprintf("%s-database", clusterName)
 }
 
 func toProjectIdExport(projectName string) string {
