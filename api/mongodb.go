@@ -5,6 +5,7 @@ package mongodb
 
 import (
 	"encoding/json"
+
 	"github.com/simple-container-com/api/pkg/api"
 )
 
@@ -19,6 +20,21 @@ type AtlasConfig struct {
 	// read access to local. That access exposes all databases' writes.
 	OplogReaders []string `json:"oplogReaders,omitempty" yaml:"oplogReaders,omitempty"`
 
+	// Database is the per-cluster primary database name. When set, the
+	// cluster exports `<cluster>-database` so sibling resources (e.g. the
+	// sc-component-backup plugin's MatchConsumerToDatabase matcher) can
+	// resolve the target DB without duplicating it in their own config.
+	//
+	// Atlas does not model databases as first-class resources — a DB
+	// appears when a user writes to it — so this field is purely
+	// advisory on the provider side. It only drives the export.
+	//
+	// Empty by default: pre-slice-1d.3 operator stacks don't set it, no
+	// `-database` export is published, and sibling matchers return "no
+	// match" (safe degradation). Slice 1d scoped-user mint on the
+	// backup component is the first consumer; operators who want
+	// per-consumer scoped users on their Mongo cluster declare it.
+	Database       string                        `json:"database,omitempty" yaml:"database,omitempty"`
 	Admins         []string                      `json:"admins" yaml:"admins"`
 	Developers     []string                      `json:"developers" yaml:"developers"`
 	InstanceSize   string                        `json:"instanceSize" yaml:"instanceSize"`

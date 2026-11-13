@@ -7,14 +7,13 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/pulumi/pulumi-mongodbatlas/sdk/v3/go/mongodbatlas"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
-
-	"github.com/pulumi/pulumi-mongodbatlas/sdk/v3/go/mongodbatlas"
 
 	mongoApi "github.com/simple-container-com/sc-plugin-mongodb/api"
 )
@@ -159,6 +158,59 @@ func TestNoDbUserExportsWithoutOperators(t *testing.T) {
 		if len(name) > len("-db-user") && name[len(name)-len("-db-user"):] == "-db-user" {
 			t.Errorf("unexpected credential export %q for a cluster with no admins/developers", name)
 		}
+	}
+}
+
+// Slice 1d.3 of sc-components-platform: `<cluster>-database` export when
+// the operator sets `config.database:`. sc-component-backup's matcher
+// (MatchConsumerToDatabase in sc-component-backup plugin/internal/
+// scoped_user.go) resolves the per-consumer target DB via the
+// `-database` suffix, so the key must land as a plain string scalar for
+// core's harvest to carry it through to the sibling's dependency outputs.
+func TestDatabaseExport_PublishedWhenSet(t *testing.T) {
+	exports := renderExports(t, &mongoApi.AtlasConfig{
+		Adopt:       true,
+		ProjectId:   "697a574e90d5387e4a889f5f",
+		ClusterName: "infra--mongodb--staging",
+		Database:    "forge_app",
+	})
+
+	got, ok := exports["infra--mongodb--staging-database"]
+	if !ok {
+		t.Fatalf("no export %q; keys: %v", "infra--mongodb--staging-database", keysOf(exports))
+	}
+	if got.err != nil {
+		t.Fatalf("export failed to resolve: %v", got.err)
+	}
+	// DB name is NOT a secret — a bucket name analogue; the credentials
+	// embedded in mongo-uri carry the secret-marked ones.
+	if got.secret {
+		t.Errorf("`-database` export is marked secret; it holds a DB name, not a credential")
+	}
+	s, isString := got.value.(string)
+	if !isString {
+		t.Fatalf("`-database` export is %T, not a string: core's harvest would drop it", got.value)
+	}
+	if s != "forge_app" {
+		t.Errorf("`-database` export = %q, want %q", s, "forge_app")
+	}
+}
+
+// Legacy stacks that pre-date the field see no `-database` export —
+// sibling matchers (sc-component-backup) silently return "no match" and
+// the scoped-user mint path stays dormant. Guards against a bug where
+// an empty-string DB name slips through and takes a sibling down with
+// a confusing `Database required` later in Atlas REST.
+func TestDatabaseExport_AbsentWhenUnset(t *testing.T) {
+	exports := renderExports(t, &mongoApi.AtlasConfig{
+		Adopt:       true,
+		ProjectId:   "697a574e90d5387e4a889f5f",
+		ClusterName: "infra--mongodb--staging",
+		// Database intentionally unset.
+	})
+
+	if _, ok := exports["infra--mongodb--staging-database"]; ok {
+		t.Errorf("`-database` export leaked on an unset config — must be opt-in")
 	}
 }
 
