@@ -213,11 +213,27 @@ func Cluster(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params 
 	if atlasCfg.AllowsPublicAccess() {
 		params.Log.Info(ctx.Context(), "configure MongoDB Atlas ip access list for cluster %q in stack %q in %q",
 			clusterName, input.StackParams.StackName, input.StackParams.Environment)
+		// sdk.Protect guards against a cross-stack destroy incident.
+		// Atlas IP allow entries are PROJECT-level, not per-cluster — two
+		// Pulumi stacks that share one Atlas project both "own" the same
+		// `0.0.0.0/0` entry in their own state. The second stack's
+		// `sc destroy` deletes the entry on both sides, severing the
+		// shared allow-all policy for every cluster in the project until
+		// an operator re-adds it manually. Live-caught 2026-11-14: a
+		// backup-smoke-1d stack sharing projectId 697a574e... with the
+		// live `infra--mongodb--staging` cluster deleted the 0.0.0.0/0
+		// entry at 01:53:21+03 (Atlas audit log: `networkPermissionListEntry
+		// "0.0.0.0/0"` removed by Public API key qhwvlvvl). Operators who
+		// want to drop the entry on purpose do so with explicit
+		// `pulumi state unprotect` + a `sc destroy` after, matching how
+		// deletionProtection is managed on the cluster itself.
+		protectOpts := append([]sdk.ResourceOption{}, opts...)
+		protectOpts = append(protectOpts, sdk.Protect(true))
 		_, err := mongodbatlas.NewProjectIpAccessList(ctx, fmt.Sprintf("%s-ip-access-list", clusterName), &mongodbatlas.ProjectIpAccessListArgs{
 			CidrBlock: sdk.StringPtr("0.0.0.0/0"),
 			Comment:   sdk.StringPtr("Allow all access to the cluster (TODO: restrict to our cluster only)"),
 			ProjectId: projectId,
-		}, opts...)
+		}, protectOpts...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create mongodb ip access list for stack %q", stack.Name)
 		}
