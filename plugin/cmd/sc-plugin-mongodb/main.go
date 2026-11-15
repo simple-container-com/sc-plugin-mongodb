@@ -63,6 +63,7 @@ import (
 
 	mongoApi "github.com/simple-container-com/sc-plugin-mongodb/api"
 	mongoInternal "github.com/simple-container-com/sc-plugin-mongodb/plugin/internal"
+	mongoPeer "github.com/simple-container-com/sc-plugin-mongodb/plugin/internal/peer"
 )
 
 type mongoPlugin struct {
@@ -87,7 +88,25 @@ func (p *mongoPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*s
 			// pulumi-random — generates per-stack DB passwords.
 			{Package: "random", Version: "4.19.0"},
 		},
+		// Peer-invoke capabilities (api PR #616 → v2026.11.63). SC core's
+		// broker routes cross-plugin calls here; the actual handlers run
+		// out of plugin/internal/peer. First consumer is
+		// sc-component-backup (Tier-4 of sc-components-backup-scalar-defaults):
+		// the backup component drops its `atlasAdmin:` block + asks
+		// mongodb to mint scoped users via peer-invoke.
+		PeerCapabilities: []string{mongoPeer.MintScopedUser, mongoPeer.DeleteScopedUser},
 	}, nil
+}
+
+// PluginInvoke is the capability dispatcher. SC core's broker forwards
+// a cross-plugin PluginInvoke here (after confirming the capability
+// is advertised in Schema's PeerCapabilities above); runtime's
+// HandlePluginInvoke switches on the capability name and runs the
+// handler registered at plugin startup (see RegisterCapabilities in
+// plugin/internal/peer).
+func (p *mongoPlugin) PluginInvoke(ctx context.Context, req *scpluginv1.PluginInvokeRequest) (*scpluginv1.PluginInvokeResponse, error) {
+	p.progress.Info("plugin-invoke", fmt.Sprintf("capability=%q caller=%q", req.GetCapability(), req.GetCallingPlugin()))
+	return runtime.HandlePluginInvoke(ctx, req)
 }
 
 func (p *mongoPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (resp *scpluginv1.ProviderResponse, err error) {
@@ -207,6 +226,33 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 	if err := decodeInputsAs(req.GetInputs(), cfg); err != nil {
 		return nil, errors.Wrap(err, "decode AtlasConfig from ComputeProcess inputs")
 	}
+
+	// Stash Atlas creds + cluster connection URI in the peer cache so
+	// peer-invoke handlers (mint-scoped-user, delete-scoped-user) can
+	// mint users on behalf of calling plugins (e.g. sc-component-backup
+	// Tier-4). The cache is process-local; it survives for this plugin
+	// subprocess's lifetime (= this SC deploy). See
+	// plugin/internal/peer/peer.go header for the design.
+	//
+	// The cluster URI is read from the parent-stack outputs via the
+	// StackReference opened below for the compute processor's own
+	// needs — but for the stash we use the per-cluster output name
+	// mongodbInternal exports (`<cluster>-mongo-uri-with-options`,
+	// `<cluster>-database`, etc.). The simplest safe stash is the
+	// known creds only; the URI comes from ClusterComputeProcessor's
+	// published env vars which the caller plugin reads separately
+	// (via slice 1d.7 auto-discover). Peer handlers construct the
+	// scoped URI by weaving creds into the cluster's srv string.
+	mongoPeer.StashCreds(req.GetResourceName(), mongoPeer.ClusterCreds{
+		PublicKey:  cfg.PublicKey,
+		PrivateKey: cfg.PrivateKey,
+		ProjectID:  cfg.ProjectId,
+		// ClusterURI left empty — the ClusterComputeProcessor emits
+		// MONGO_URI via the collector; peer handlers don't need it
+		// here (they build a `mongodb+srv://<user>:<pw>@<host>/...`
+		// with a placeholder host if operator didn't plumb one, or
+		// the caller supplies the URI).
+	})
 
 	input := resourceInputFromComputeProcess(req, cfg, parent)
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
@@ -449,6 +495,13 @@ func main() {
 	// stack trace is often what's needed to identify a nil-ptr root
 	// cause. sc-plugin-aws sets this for the same reason.
 	_ = os.Setenv("GOTRACEBACK", "all")
+	// Register peer-invoke capabilities BEFORE Serve starts handling
+	// RPCs. Panics fail fast (fatal in main is appropriate) — a
+	// capability registration error means a developer typo'd a
+	// capability name twice, not a runtime failure.
+	if err := mongoPeer.RegisterCapabilities(); err != nil {
+		panic("sc-plugin-mongodb: register peer capabilities: " + err.Error())
+	}
 	impl := &mongoPlugin{progress: scPlugin.NewPublisher(0)}
 	scPlugin.Serve(scPlugin.ServerConfig{
 		Impl: impl,
