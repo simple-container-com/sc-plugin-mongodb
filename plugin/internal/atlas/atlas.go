@@ -88,9 +88,19 @@ type Role struct {
 // row. Atlas does NOT return the password on subsequent GETs, so the
 // one-shot-create-then-push flow is the design.
 //
-// Returns the created user (with the generated password populated) or an
-// error from Atlas. 409 (user already exists) is NOT auto-recovered; the
-// caller should Delete + re-create if they need a fresh password.
+// Idempotency: on HTTP 409 USER_ALREADY_EXISTS the caller's intent is
+// "this user should exist with these credentials"; PATCH the existing
+// user with the generated password instead of failing. Fires in two
+// cases on the live path:
+//
+//  1. Stale users from earlier failed deploys (PreDestroy orphan-user
+//     gap — see roadmap `mongodb-exports-creds-for-predestroy`).
+//  2. ComputeProcess retrying within a single deploy after a
+//     downstream failure (SC core's push-register retry loop runs
+//     the whole mint+register cycle on a 5xx from the backup service).
+//
+// Returns the created/updated user with the password the caller gets
+// to push downstream.
 func (c *Client) CreateDatabaseUser(ctx context.Context, projectID string, user DatabaseUser) (*DatabaseUser, error) {
 	if user.Password == "" {
 		pw, err := generatePassword(24)
@@ -115,6 +125,12 @@ func (c *Client) CreateDatabaseUser(ctx context.Context, projectID string, user 
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusConflict {
+		// 409 USER_ALREADY_EXISTS → PATCH the existing user with the
+		// freshly-generated password. Caller then pushes the password
+		// to the tenant record as in the happy path.
+		return c.patchDatabaseUser(ctx, projectID, user)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("atlas CreateDatabaseUser: HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 512))
 	}
@@ -126,6 +142,45 @@ func (c *Client) CreateDatabaseUser(ctx context.Context, projectID string, user 
 	// has the full create-then-push state.
 	created.Password = user.Password
 	return &created, nil
+}
+
+// patchDatabaseUser updates a user's password + roles via PATCH so a
+// 409 USER_ALREADY_EXISTS on create becomes an idempotent "rotate +
+// return fresh creds" outcome. Atlas's PATCH endpoint expects the
+// same DatabaseUser shape; only populated fields are updated.
+//
+// Returns the updated user with the password the caller passed in
+// (Atlas never echoes it on the wire).
+func (c *Client) patchDatabaseUser(ctx context.Context, projectID string, user DatabaseUser) (*DatabaseUser, error) {
+	if user.DatabaseName == "" {
+		user.DatabaseName = "admin"
+	}
+	path := fmt.Sprintf("/api/atlas/v1.0/groups/%s/databaseUsers/%s/%s",
+		projectID, user.DatabaseName, user.Username)
+	// PATCH body: send the new password + roles. Scopes/labels left
+	// untouched by omission (Atlas treats absent fields as no-change).
+	body, err := json.Marshal(map[string]any{
+		"password": user.Password,
+		"roles":    user.Roles,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal patch body: %w", err)
+	}
+	resp, err := c.doDigest(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("atlas PatchDatabaseUser(409 recovery): HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 512))
+	}
+	var updated DatabaseUser
+	if err := json.Unmarshal(respBody, &updated); err != nil {
+		return nil, fmt.Errorf("unmarshal atlas patch response: %w", err)
+	}
+	updated.Password = user.Password
+	return &updated, nil
 }
 
 // DeleteDatabaseUser removes a user by username+authDB from the project.
