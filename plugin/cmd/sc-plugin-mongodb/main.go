@@ -66,6 +66,15 @@ import (
 	mongoPeer "github.com/simple-container-com/sc-plugin-mongodb/plugin/internal/peer"
 )
 
+// version is stamped by the release workflow via
+// `go build -ldflags "-X main.version=${VERSION}"`. The default `"dev"`
+// is what a local `make build` or a test run sees. Without this
+// variable the ldflag landed on nothing (Go linker silently ignores
+// `-X` against a missing symbol) and the pre-engine load line always
+// read `vmongodb-0.0.1`. See sc-component-backup#38 for the full
+// write-up; roadmap `items/sc-plugin-version-stamp-missing-fleetwide.md`.
+var version = "dev"
+
 type mongoPlugin struct {
 	scpluginv1.UnimplementedSCCloudPluginServer
 
@@ -75,7 +84,7 @@ type mongoPlugin struct {
 
 func (p *mongoPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion:         "mongodb-0.0.1",
+		PluginVersion:         "mongodb-" + version,
 		ProviderTypes:         []string{mongoApi.ProviderType},
 		ResourceTypes:         []string{mongoApi.ResourceTypeMongodbAtlas},
 		ComputeProcessorTypes: []string{mongoApi.ResourceTypeMongodbAtlas},
