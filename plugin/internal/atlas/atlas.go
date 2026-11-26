@@ -7,7 +7,8 @@
 // behalf of calling plugins (e.g. sc-component-backup):
 //
 //   - CreateDatabaseUser(projectID, user) — upsert a user with
-//     readWrite on a single DB, auto-generated 32-byte password.
+//     readWrite on a single DB, at a password the caller supplies
+//     (derived; see peer.DerivePassword).
 //   - DeleteDatabaseUser(projectID, username, authDB) — tear down when
 //     the consumer is destroyed.
 //
@@ -81,16 +82,25 @@ type Role struct {
 	CollectionName string `json:"collectionName,omitempty"`
 }
 
-// CreateDatabaseUser upserts a DatabaseUser in the Atlas project. If
-// `user.Password` is empty, generates a cryptographically random 24-char
-// password and sets it on the returned struct — the caller is responsible
-// for the one-time push of that password to the backup service's tenant
-// row. Atlas does NOT return the password on subsequent GETs, so the
-// one-shot-create-then-push flow is the design.
+// CreateDatabaseUser upserts a DatabaseUser in the Atlas project.
+//
+// **Callers should always set `user.Password`.** Atlas does NOT return a
+// password on any GET, so a password this function invents has exactly
+// one copy — the returned struct — and the caller's single push of it
+// downstream is the only thing standing between that consumer and an
+// unrecoverable credential. `peer.MintHandler` therefore derives the
+// password (see peer.DerivePassword) so that every deploy upserts the
+// same value, and refuses to mint at all when it cannot.
+//
+// If `user.Password` IS empty this still generates a cryptographically
+// random 24-char one, for callers that genuinely want a one-shot
+// credential. That path is no longer used by the live mint flow and is
+// kept only so the client stays a general Atlas client rather than a
+// one-caller helper.
 //
 // Idempotency: on HTTP 409 USER_ALREADY_EXISTS the caller's intent is
 // "this user should exist with these credentials"; PATCH the existing
-// user with the generated password instead of failing. Fires in two
+// user with the caller's password instead of failing. Fires in two
 // cases on the live path:
 //
 //  1. Stale users from earlier failed deploys (PreDestroy orphan-user
@@ -98,6 +108,12 @@ type Role struct {
 //  2. ComputeProcess retrying within a single deploy after a
 //     downstream failure (SC core's push-register retry loop runs
 //     the whole mint+register cycle on a 5xx from the backup service).
+//
+// With a derived password that PATCH is a no-op in effect, which is the
+// point. With a generated one it is a ROTATION, and the deploy that
+// fires it has to successfully deliver the new value or it has broken
+// the consumer — that is how forge-messenger and forge-conductor lost
+// nine hours of backups on 2026-11-25.
 //
 // Returns the created/updated user with the password the caller gets
 // to push downstream.

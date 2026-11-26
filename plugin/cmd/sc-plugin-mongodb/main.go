@@ -256,6 +256,13 @@ func (p *mongoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.Comput
 		PublicKey:  cfg.PublicKey,
 		PrivateKey: cfg.PrivateKey,
 		ProjectID:  cfg.ProjectId,
+		// Scoped-user passwords are DERIVED from this salt, not
+		// generated, so a consumer's credential survives its own
+		// redeploys and a lost mint reply repairs itself on the next
+		// one. Empty here is not fatal at stash time — MintHandler
+		// refuses with a message naming the config key, which is a
+		// better diagnosis than a missing cache entry would give.
+		PasswordSalt: cfg.ScopedUserPasswordSalt,
 		// ClusterURI left empty — the ClusterComputeProcessor emits
 		// MONGO_URI via the collector; peer handlers don't need it
 		// here (they build a `mongodb+srv://<user>:<pw>@<host>/...`
