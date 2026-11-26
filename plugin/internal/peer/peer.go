@@ -116,6 +116,15 @@ type ClusterCreds struct {
 	// ClusterURI is the mongodb+srv:// base URL for this cluster
 	// (without auth) — handlers weave in the scoped user's creds.
 	ClusterURI string
+	// PasswordSalt is the operator-supplied salt every scoped user's
+	// password is derived from (AtlasConfig.ScopedUserPasswordSalt).
+	// Required: see MintHandler's gate and DerivePassword's doc for why
+	// a random password per deploy is the bug and not the feature.
+	PasswordSalt string
+	// BaseURL overrides https://cloud.mongodb.com. Empty on every live
+	// path; set by tests, and the seam an Atlas-for-Government project
+	// would need.
+	BaseURL string
 }
 
 // credCache is the process-wide map from cluster name to Atlas creds.
@@ -133,6 +142,12 @@ var credCache = struct {
 //
 // Zero-fielded values are silently rejected (a fleet-wide invariant:
 // Atlas creds are non-optional for every mongodb resource).
+//
+// PasswordSalt is deliberately NOT part of that check even though
+// MintHandler requires it. Dropping the whole entry over a missing salt
+// would surface as "no cached credentials for cluster X — check your
+// `uses:` ordering", which is a different and wrong diagnosis. Stash
+// it, and let the handler name the actual missing config key.
 func StashCreds(clusterName string, c ClusterCreds) {
 	if clusterName == "" || c.PublicKey == "" || c.PrivateKey == "" || c.ProjectID == "" {
 		return
@@ -201,9 +216,32 @@ func MintHandler(ctx context.Context, callingPlugin string, payloadJSON []byte) 
 		username = username[:100]
 	}
 
+	// Derive the password instead of letting Atlas's create generate a
+	// random one. This is what makes the mint idempotent: every deploy
+	// PATCHes the same value, so a lost mint reply is harmless and the
+	// next deploy repairs it. DerivePassword's doc carries the incident
+	// history; the short version is that a random password has exactly
+	// one copy, in flight.
+	//
+	// Hard-fail on a missing salt rather than falling back to random.
+	// A fallback would be silent, would restore the exact bug this
+	// guard exists to prevent, and would do it on the path where the
+	// damage is invisible until the consumer's next scheduled dump.
+	if creds.PasswordSalt == "" {
+		return nil, errors.Errorf("mint-scoped-user: cluster %q has no password salt — set `scopedUserPasswordSalt` on that mongodb-atlas resource's config (fleet convention: a value in the SC registry, referenced as \"${secret:<name>}\"). Refusing to mint with a random password: Atlas never returns one, so the mint reply would be its only copy and any lost push would break this consumer's stored credential until its next deploy.", req.Cluster)
+	}
+	password, err := DerivePassword(creds.PasswordSalt, req.Cluster, creds.ProjectID, req.Database, username)
+	if err != nil {
+		return nil, errors.Wrapf(err, "mint-scoped-user: derive password for %s on cluster %q", username, req.Cluster)
+	}
+
 	client := atlas.NewClient(creds.PublicKey, creds.PrivateKey)
+	if creds.BaseURL != "" {
+		client.BaseURL = creds.BaseURL
+	}
 	user, err := client.CreateDatabaseUser(ctx, creds.ProjectID, atlas.DatabaseUser{
 		Username:     username,
+		Password:     password,
 		DatabaseName: "admin",
 		Roles: []atlas.Role{{
 			RoleName:     req.RoleName,
@@ -241,6 +279,9 @@ func DeleteHandler(ctx context.Context, _ string, payloadJSON []byte) ([]byte, e
 	}
 
 	client := atlas.NewClient(creds.PublicKey, creds.PrivateKey)
+	if creds.BaseURL != "" {
+		client.BaseURL = creds.BaseURL
+	}
 	if err := client.DeleteDatabaseUser(ctx, creds.ProjectID, req.Username, "admin"); err != nil {
 		return nil, errors.Wrapf(err, "delete-scoped-user: Atlas REST DeleteDatabaseUser(%s) on cluster %q", req.Username, req.Cluster)
 	}

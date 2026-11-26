@@ -34,7 +34,32 @@ type AtlasConfig struct {
 	// match" (safe degradation). Slice 1d scoped-user mint on the
 	// backup component is the first consumer; operators who want
 	// per-consumer scoped users on their Mongo cluster declare it.
-	Database       string                        `json:"database,omitempty" yaml:"database,omitempty"`
+	Database string `json:"database,omitempty" yaml:"database,omitempty"`
+
+	// ScopedUserPasswordSalt is the secret every peer-invoke-minted
+	// scoped user's password is derived from — HMAC-SHA256 over the
+	// salt and the user's identity, so one consumer's password is
+	// stable across its deploys and distinct from every other
+	// consumer's. See plugin/internal/peer.DerivePassword.
+	//
+	// Required by the `mint-scoped-user` capability: without it the
+	// handler refuses rather than falling back to a random password.
+	// A random password is the bug it replaces — Atlas never returns
+	// one, so the mint reply is its only copy and every deploy
+	// rotates it, which means any deploy that fails to deliver the
+	// reply has silently broken that consumer's stored credential
+	// with no repair path short of another full deploy.
+	//
+	// Not required by anything else: clusters with no peer-invoke
+	// consumers (no sc-component-backup, no sc-component-observatory)
+	// never reach the handler and can leave it unset.
+	//
+	// Fleet convention is a value in the SC registry, referenced as
+	// "${secret:<name>}". Changing it rotates every derived password
+	// on that cluster, which takes effect per consumer as each one
+	// redeploys.
+	ScopedUserPasswordSalt string `json:"scopedUserPasswordSalt,omitempty" yaml:"scopedUserPasswordSalt,omitempty"`
+
 	Admins         []string                      `json:"admins" yaml:"admins"`
 	Developers     []string                      `json:"developers" yaml:"developers"`
 	InstanceSize   string                        `json:"instanceSize" yaml:"instanceSize"`
